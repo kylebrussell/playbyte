@@ -4,3 +4,9 @@
 [submodule "vendor/libretro-cores/bsnes"]
 	path = vendor/libretro-cores/bsnes
 	url = https://github.com/libretro/bsnes-libretro.git
+[submodule "vendor/libretro-cores/gambatte"]
+	path = vendor/libretro-cores/gambatte
+	url = https://github.com/libretro/gambatte-libretro.git
+[submodule "vendor/libretro-cores/mgba"]
+	path = vendor/libretro-cores/mgba
+	url = https://github.com/libretro/mgba.git

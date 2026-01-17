@@ -33,6 +33,22 @@ const CORES: &[CoreSpec] = &[
         output_dir: "out",
         make_args: &["target=libretro", "local=false"],
     },
+    CoreSpec {
+        id: "gambatte",
+        dir: "gambatte",
+        makefile_dir: "",
+        output: "gambatte_libretro",
+        output_dir: "",
+        make_args: &[],
+    },
+    CoreSpec {
+        id: "mgba",
+        dir: "mgba",
+        makefile_dir: "",
+        output: "mgba_libretro",
+        output_dir: "",
+        make_args: &[],
+    },
 ];
 
 fn main() -> Result<()> {

@@ -7,3 +7,5 @@ distribution constraints. Populate during core selection.
 | --- | --- | --- | --- |
 | `mesen` | NES | GPL-3.0 | libretro `mesen` core (verify upstream license on update) |
 | `bsnes` | SNES | GPL-3.0 | libretro `bsnes` core (verify upstream license on update) |
+| `gambatte` | GBC | GPL-2.0 | libretro `gambatte` core (verify upstream license on update) |
+| `mgba` | GBA | MPL-2.0 | libretro `mgba` core (verify upstream license on update) |
