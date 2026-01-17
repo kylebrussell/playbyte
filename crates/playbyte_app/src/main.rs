@@ -19,7 +19,7 @@ use playbyte_feed::{LocalByteStore, RomLibrary};
 use playbyte_types::{ByteMetadata, System};
 use sha1::{Digest, Sha1};
 use std::{
-    collections::{HashMap, HashSet, VecDeque},
+    collections::{HashMap, VecDeque},
     fs,
     path::{Path, PathBuf},
     sync::{Arc, Mutex},
@@ -406,7 +406,7 @@ impl FeedController {
         if self.items.is_empty() {
             return None;
         }
-        self.current_index = (self.current_index + 1).min(self.items.len() - 1);
+        self.current_index = (self.current_index + 1) % self.items.len();
         self.current()
     }
 
@@ -414,9 +414,7 @@ impl FeedController {
         if self.items.is_empty() {
             return None;
         }
-        if self.current_index > 0 {
-            self.current_index -= 1;
-        }
+        self.current_index = (self.current_index + self.items.len() - 1) % self.items.len();
         self.current()
     }
 
@@ -498,11 +496,15 @@ impl FeedController {
 
     fn add_byte(&mut self, metadata: ByteMetadata) {
         let rom_sha1 = metadata.rom_sha1.clone();
-        self.items.retain(|item| {
-            !matches!(item, FeedItem::RomFallback(fallback) if fallback.rom_sha1 == rom_sha1)
-        });
-        self.items.push(FeedItem::Byte(metadata));
-        self.current_index = self.items.len().saturating_sub(1);
+        if let Some(index) = self.items.iter().position(|item| {
+            matches!(item, FeedItem::RomFallback(fallback) if fallback.rom_sha1 == rom_sha1)
+        }) {
+            self.items.insert(index + 1, FeedItem::Byte(metadata));
+            self.current_index = index + 1;
+        } else {
+            self.items.push(FeedItem::Byte(metadata));
+            self.current_index = self.items.len().saturating_sub(1);
+        }
     }
 
     fn add_fallback_rom(
@@ -511,9 +513,8 @@ impl FeedController {
         core_path: Option<PathBuf>,
     ) -> Result<()> {
         let rom_sha1 = hash_rom(&rom_path)?;
-        if self.items.iter().any(|item| match item {
-            FeedItem::Byte(byte) => byte.rom_sha1 == rom_sha1,
-            FeedItem::RomFallback(fallback) => fallback.rom_sha1 == rom_sha1,
+        if self.items.iter().any(|item| {
+            matches!(item, FeedItem::RomFallback(fallback) if fallback.rom_sha1 == rom_sha1)
         }) {
             return Ok(());
         }
@@ -555,8 +556,14 @@ fn build_feed_items(
     roms: &RomLibrary,
     bytes: &[ByteMetadata],
 ) -> Result<Vec<FeedItem>> {
-    let mut items: Vec<FeedItem> = bytes.iter().cloned().map(FeedItem::Byte).collect();
-    let mut covered_roms: HashSet<String> = bytes.iter().map(|byte| byte.rom_sha1.clone()).collect();
+    let mut items: Vec<FeedItem> = Vec::new();
+    let mut bytes_by_rom: HashMap<String, Vec<ByteMetadata>> = HashMap::new();
+    for byte in bytes {
+        bytes_by_rom
+            .entry(byte.rom_sha1.clone())
+            .or_default()
+            .push(byte.clone());
+    }
 
     let available_cores = list_core_ids(&core_locator.root);
     let nes_core = select_default_core(System::Nes, &available_cores, bytes, core_locator);
@@ -565,28 +572,30 @@ fn build_feed_items(
     let mut rom_entries = roms.entries();
     rom_entries.sort_by(|a, b| a.1.to_string_lossy().cmp(&b.1.to_string_lossy()));
     for (rom_sha1, rom_path) in rom_entries {
-        if covered_roms.contains(&rom_sha1) {
-            continue;
-        }
         let system = system_from_rom_path(&rom_path);
         let core_id = match system {
             System::Nes => nes_core.clone(),
             System::Snes => snes_core.clone(),
         };
-        let Some(core_id) = core_id else {
-            continue;
-        };
-        let title = title_from_rom_path(&rom_path);
-        let core_path = core_locator.resolve(&core_id);
-        items.push(FeedItem::RomFallback(RomFallback {
-            rom_sha1: rom_sha1.clone(),
-            rom_path,
-            system,
-            title,
-            core_id,
-            core_path,
-        }));
-        covered_roms.insert(rom_sha1);
+        if let Some(core_id) = core_id {
+            let title = title_from_rom_path(&rom_path);
+            let core_path = core_locator.resolve(&core_id);
+            items.push(FeedItem::RomFallback(RomFallback {
+                rom_sha1: rom_sha1.clone(),
+                rom_path: rom_path.clone(),
+                system: system.clone(),
+                title,
+                core_id,
+                core_path,
+            }));
+        }
+        if let Some(bytes_for_rom) = bytes_by_rom.remove(&rom_sha1) {
+            items.extend(bytes_for_rom.into_iter().map(FeedItem::Byte));
+        }
+    }
+
+    for remaining in bytes_by_rom.into_values() {
+        items.extend(remaining.into_iter().map(FeedItem::Byte));
     }
 
     Ok(items)
@@ -1204,10 +1213,11 @@ fn fs_main(in: VertexOut) -> @location(0) vec4<f32> {
             }
             let current = feed.current_index;
             let position = indices.iter().position(|&idx| idx == current).unwrap_or(0);
+            let len = indices.len();
             let next_pos = if delta > 0 {
-                (position + 1).min(indices.len().saturating_sub(1))
+                (position + 1) % len
             } else {
-                position.saturating_sub(1)
+                (position + len - 1) % len
             };
             self.select_feed_index(indices[next_pos]);
             return;
