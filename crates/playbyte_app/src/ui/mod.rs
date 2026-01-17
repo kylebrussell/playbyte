@@ -36,6 +36,7 @@ pub struct UiState {
     transition_start: Option<Instant>,
     rename_target: Option<usize>,
     rename_draft: String,
+    last_centered_index: Option<usize>,
 }
 
 impl UiState {
@@ -51,6 +52,7 @@ impl UiState {
             transition_start: None,
             rename_target: None,
             rename_draft: String::new(),
+            last_centered_index: None,
         }
     }
 
@@ -97,6 +99,10 @@ impl UiState {
 
     pub fn toggle_overlay(&mut self) {
         self.overlay_visible = !self.overlay_visible;
+    }
+
+    pub fn is_editing_text(&self) -> bool {
+        self.rename_target.is_some()
     }
 
     fn render_top_bar(
@@ -339,21 +345,26 @@ impl UiState {
                                             self.record_interaction();
                                         }
                                         if selected {
-                                            ui.scroll_to_rect(
-                                                response.rect,
-                                                Some(egui::Align::Center),
-                                            );
+                                            if self.last_centered_index != Some(idx) {
+                                                ui.scroll_to_rect(
+                                                    response.rect,
+                                                    Some(egui::Align::Center),
+                                                );
+                                                self.last_centered_index = Some(idx);
+                                            }
                                         }
                                     }
                                 });
                             });
                     } else {
+                        self.last_centered_index = None;
                         ui.label(
                             egui::RichText::new("No Bytes found in data/bytes.")
                                 .color(self.theme.text_dim),
                         );
                     }
                 } else {
+                    self.last_centered_index = None;
                     ui.label(
                         egui::RichText::new(
                             "No feed loaded. Pass --core and --rom or add Bytes in ./data/bytes.",

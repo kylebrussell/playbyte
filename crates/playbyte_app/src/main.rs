@@ -1161,11 +1161,14 @@ fn fs_main(in: VertexOut) -> @location(0) vec4<f32> {
     }
 
     fn handle_keyboard(&mut self, key: KeyCode, pressed: bool) {
-        if self.gui.ctx.wants_keyboard_input() {
+        if self.ui.is_editing_text() {
             return;
         }
         if let Some(action) = input::action_from_key(key, pressed) {
             self.apply_action(action);
+            return;
+        }
+        if self.gui.ctx.wants_keyboard_input() {
             return;
         }
 

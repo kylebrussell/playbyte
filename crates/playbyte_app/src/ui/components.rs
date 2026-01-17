@@ -20,12 +20,10 @@ pub fn badge(ui: &mut egui::Ui, label: &str, fill: Color32, text: Color32) -> Re
 }
 
 pub fn primary_button(ui: &mut egui::Ui, label: &str, theme: &UiTheme) -> Response {
-    egui::Frame::none()
+    let button = egui::Button::new(egui::RichText::new(label).color(theme.text_on_accent))
         .fill(theme.accent)
-        .rounding(Rounding::same(12.0))
-        .inner_margin(egui::Margin::symmetric(14.0, 8.0))
-        .show(ui, |ui| ui.label(egui::RichText::new(label).color(theme.text_on_accent)))
-        .response
+        .rounding(Rounding::same(12.0));
+    ui.add(button)
         .on_hover_cursor(egui::CursorIcon::PointingHand)
 }
 
