@@ -1,12 +1,26 @@
-This directory holds vendored libretro core source trees.
+This directory holds vendored libretro core source trees as git submodules.
 
-Expected layout:
+## Cores
 
-- `mesen/` (libretro core source)
-- `bsnes/` (libretro core source)
+| Core | System | Repository | Version |
+|------|--------|------------|---------|
+| Mesen | NES | [libretro/Mesen](https://github.com/libretro/Mesen) | 0.9.9 |
+| bsnes | SNES | [libretro/bsnes-libretro](https://github.com/libretro/bsnes-libretro) | v115 |
+
+## Setup
+
+After cloning the repository, initialize the submodules:
+
+```bash
+git submodule update --init --recursive
+```
+
+## Building
 
 Build and bundle cores with:
 
-```
+```bash
 cargo xtask build-cores
 ```
+
+Built cores are placed in `dist/cores/`.

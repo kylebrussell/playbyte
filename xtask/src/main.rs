@@ -8,22 +8,30 @@ use std::{
 struct CoreSpec {
     id: &'static str,
     dir: &'static str,
+    makefile_dir: &'static str,
     output: &'static str,
     output_dir: &'static str,
+    /// Extra make arguments (e.g., target=libretro)
+    make_args: &'static [&'static str],
 }
 
 const CORES: &[CoreSpec] = &[
     CoreSpec {
         id: "mesen",
         dir: "mesen",
+        makefile_dir: "Libretro",
         output: "mesen_libretro",
         output_dir: "",
+        // Clear ARCHFLAGS to avoid building universal binary (i386+x86_64)
+        make_args: &["ARCHFLAGS="],
     },
     CoreSpec {
         id: "bsnes",
         dir: "bsnes",
+        makefile_dir: "bsnes",
         output: "bsnes_libretro",
-        output_dir: "",
+        output_dir: "out",
+        make_args: &["target=libretro", "local=false"],
     },
 ];
 
@@ -45,24 +53,43 @@ fn build_cores() -> Result<()> {
     fs::create_dir_all(&dist_dir)?;
 
     for core in CORES {
-        let core_dir = Path::new("vendor/libretro-cores").join(core.dir);
-        if !core_dir.exists() {
-            bail!("Missing core source at {}", core_dir.display());
+        let core_base = Path::new("vendor/libretro-cores").join(core.dir);
+        if !core_base.exists() {
+            bail!("Missing core source at {}", core_base.display());
         }
 
-        let status = Command::new("make")
-            .arg("-f")
-            .arg("Makefile.libretro")
-            .current_dir(&core_dir)
+        // Build directory is core_base + makefile_dir
+        let build_dir = if core.makefile_dir.is_empty() {
+            core_base.clone()
+        } else {
+            core_base.join(core.makefile_dir)
+        };
+
+        let mut cmd = Command::new("make");
+        cmd.current_dir(&build_dir);
+
+        // Add any core-specific make arguments
+        for arg in core.make_args {
+            cmd.arg(*arg);
+        }
+
+        println!("Building {} in {} ...", core.id, build_dir.display());
+        let status = cmd
             .status()
             .with_context(|| format!("failed to build core {}", core.id))?;
         if !status.success() {
             bail!("core build failed for {}", core.id);
         }
 
-        let output_path = core_dir
-            .join(core.output_dir)
-            .join(format!("{}.{}", core.output, ext));
+        // Output path: build_dir + output_dir + output.ext
+        let output_path = if core.output_dir.is_empty() {
+            build_dir.join(format!("{}.{}", core.output, ext))
+        } else {
+            build_dir
+                .join(core.output_dir)
+                .join(format!("{}.{}", core.output, ext))
+        };
+
         if !output_path.exists() {
             bail!("missing built core output at {}", output_path.display());
         }

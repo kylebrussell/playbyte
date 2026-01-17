@@ -1,0 +1,6 @@
+[submodule "vendor/libretro-cores/mesen"]
+	path = vendor/libretro-cores/mesen
+	url = https://github.com/libretro/Mesen.git
+[submodule "vendor/libretro-cores/bsnes"]
+	path = vendor/libretro-cores/bsnes
+	url = https://github.com/libretro/bsnes-libretro.git
