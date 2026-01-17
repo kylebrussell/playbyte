@@ -47,7 +47,8 @@ const CORES: &[CoreSpec] = &[
         makefile_dir: "",
         output: "mgba_libretro",
         output_dir: "",
-        make_args: &[],
+        // macOS has locale_t but Makefile.libretro doesn't define HAVE_LOCALE for osx
+        make_args: &["PLATFORM_DEFINES=-DHAVE_LOCALE"],
     },
 ];
 
