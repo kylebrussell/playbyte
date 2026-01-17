@@ -1,0 +1,16 @@
+[workspace]
+resolver = "2"
+members = [
+  "crates/playbyte_app",
+  "crates/playbyte_libretro",
+  "crates/playbyte_emulation",
+  "crates/playbyte_feed",
+  "crates/playbyte_types",
+  "crates/playbyte_backend",
+  "xtask",
+]
+
+[workspace.package]
+edition = "2021"
+license = "GPL-3.0-or-later"
+repository = "https://github.com/playbyte/playbyte"
