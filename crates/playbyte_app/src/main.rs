@@ -19,7 +19,7 @@ use playbyte_feed::{LocalByteStore, RomLibrary};
 use playbyte_types::{ByteMetadata, System};
 use sha1::{Digest, Sha1};
 use std::{
-    collections::{HashMap, VecDeque},
+    collections::{HashMap, HashSet, VecDeque},
     fs,
     path::{Path, PathBuf},
     sync::{Arc, Mutex},
@@ -29,7 +29,7 @@ use time::format_description::well_known::Rfc3339;
 use uuid::Uuid;
 use wgpu::util::DeviceExt;
 use winit::{
-    event::{ElementState, Event, MouseScrollDelta, WindowEvent},
+    event::{ElementState, Event, WindowEvent},
     event_loop::EventLoopBuilder,
     keyboard::{KeyCode, PhysicalKey},
     window::WindowBuilder,
@@ -406,7 +406,7 @@ impl FeedController {
         if self.items.is_empty() {
             return None;
         }
-        self.current_index = (self.current_index + 1) % self.items.len();
+        self.current_index = (self.current_index + 1).min(self.items.len() - 1);
         self.current()
     }
 
@@ -414,7 +414,9 @@ impl FeedController {
         if self.items.is_empty() {
             return None;
         }
-        self.current_index = (self.current_index + self.items.len() - 1) % self.items.len();
+        if self.current_index > 0 {
+            self.current_index -= 1;
+        }
         self.current()
     }
 
@@ -496,15 +498,11 @@ impl FeedController {
 
     fn add_byte(&mut self, metadata: ByteMetadata) {
         let rom_sha1 = metadata.rom_sha1.clone();
-        if let Some(index) = self.items.iter().position(|item| {
-            matches!(item, FeedItem::RomFallback(fallback) if fallback.rom_sha1 == rom_sha1)
-        }) {
-            self.items.insert(index + 1, FeedItem::Byte(metadata));
-            self.current_index = index + 1;
-        } else {
-            self.items.push(FeedItem::Byte(metadata));
-            self.current_index = self.items.len().saturating_sub(1);
-        }
+        self.items.retain(|item| {
+            !matches!(item, FeedItem::RomFallback(fallback) if fallback.rom_sha1 == rom_sha1)
+        });
+        self.items.push(FeedItem::Byte(metadata));
+        self.current_index = self.items.len().saturating_sub(1);
     }
 
     fn add_fallback_rom(
@@ -513,8 +511,9 @@ impl FeedController {
         core_path: Option<PathBuf>,
     ) -> Result<()> {
         let rom_sha1 = hash_rom(&rom_path)?;
-        if self.items.iter().any(|item| {
-            matches!(item, FeedItem::RomFallback(fallback) if fallback.rom_sha1 == rom_sha1)
+        if self.items.iter().any(|item| match item {
+            FeedItem::Byte(byte) => byte.rom_sha1 == rom_sha1,
+            FeedItem::RomFallback(fallback) => fallback.rom_sha1 == rom_sha1,
         }) {
             return Ok(());
         }
@@ -556,46 +555,41 @@ fn build_feed_items(
     roms: &RomLibrary,
     bytes: &[ByteMetadata],
 ) -> Result<Vec<FeedItem>> {
-    let mut items: Vec<FeedItem> = Vec::new();
-    let mut bytes_by_rom: HashMap<String, Vec<ByteMetadata>> = HashMap::new();
-    for byte in bytes {
-        bytes_by_rom
-            .entry(byte.rom_sha1.clone())
-            .or_default()
-            .push(byte.clone());
-    }
+    let mut items: Vec<FeedItem> = bytes.iter().cloned().map(FeedItem::Byte).collect();
+    let mut covered_roms: HashSet<String> = bytes.iter().map(|byte| byte.rom_sha1.clone()).collect();
 
     let available_cores = list_core_ids(&core_locator.root);
     let nes_core = select_default_core(System::Nes, &available_cores, bytes, core_locator);
     let snes_core = select_default_core(System::Snes, &available_cores, bytes, core_locator);
+    let gbc_core = select_default_core(System::Gbc, &available_cores, bytes, core_locator);
+    let gba_core = select_default_core(System::Gba, &available_cores, bytes, core_locator);
 
     let mut rom_entries = roms.entries();
     rom_entries.sort_by(|a, b| a.1.to_string_lossy().cmp(&b.1.to_string_lossy()));
     for (rom_sha1, rom_path) in rom_entries {
+        if covered_roms.contains(&rom_sha1) {
+            continue;
+        }
         let system = system_from_rom_path(&rom_path);
         let core_id = match system {
             System::Nes => nes_core.clone(),
             System::Snes => snes_core.clone(),
+            System::Gbc => gbc_core.clone(),
+            System::Gba => gba_core.clone(),
         };
-        if let Some(core_id) = core_id {
-            let title = title_from_rom_path(&rom_path);
-            let core_path = core_locator.resolve(&core_id);
-            items.push(FeedItem::RomFallback(RomFallback {
-                rom_sha1: rom_sha1.clone(),
-                rom_path: rom_path.clone(),
-                system: system.clone(),
-                title,
-                core_id,
-                core_path,
-            }));
-        }
-        if let Some(bytes_for_rom) = bytes_by_rom.remove(&rom_sha1) {
-            items.extend(bytes_for_rom.into_iter().map(FeedItem::Byte));
-        }
-    }
-
-    for remaining in bytes_by_rom.into_values() {
-        items.extend(remaining.into_iter().map(FeedItem::Byte));
+        let Some(core_id) = core_id else {
+            continue;
+        };
+        let title = title_from_rom_path(&rom_path);
+        items.push(FeedItem::RomFallback(RomFallback {
+            rom_sha1: rom_sha1.clone(),
+            rom_path,
+            system,
+            title,
+            core_id,
+            core_path: None,
+        }));
+        covered_roms.insert(rom_sha1);
     }
 
     Ok(items)
@@ -666,6 +660,8 @@ fn select_default_core(
     let preferred = match system {
         System::Nes => &["mesen", "nestopia", "fceux", "nes"][..],
         System::Snes => &["bsnes", "snes9x", "snes"][..],
+        System::Gbc => &["gambatte", "sameboy", "gearboy", "gb"][..],
+        System::Gba => &["mgba", "gpsp", "vba", "gba"][..],
     };
     for needle in preferred {
         if let Some(core_id) = available_cores
@@ -752,8 +748,6 @@ struct State {
     accumulator: f64,
     frame_stats: FrameStats,
     data_root: PathBuf,
-    scroll_accumulator: f32,
-    last_scroll_nav: Instant,
 }
 
 impl State {
@@ -989,8 +983,6 @@ fn fs_main(in: VertexOut) -> @location(0) vec4<f32> {
             accumulator: 0.0,
             frame_stats: FrameStats::new(120),
             data_root: app_config.data_root,
-            scroll_accumulator: 0.0,
-            last_scroll_nav: Instant::now(),
         })
     }
 
@@ -1156,38 +1148,6 @@ fn fs_main(in: VertexOut) -> @location(0) vec4<f32> {
         }
     }
 
-    fn handle_scroll(&mut self, delta: &MouseScrollDelta) {
-        if self.gui.ctx.wants_keyboard_input() {
-            return;
-        }
-        let (x, y) = match delta {
-            MouseScrollDelta::LineDelta(x, y) => (*x * 40.0, *y * 40.0),
-            MouseScrollDelta::PixelDelta(pos) => (pos.x as f32, pos.y as f32),
-        };
-        let amount = if x.abs() > y.abs() { x } else { y };
-        if amount.abs() < 1.0 {
-            return;
-        }
-        let capped = amount.clamp(-240.0, 240.0);
-        self.scroll_accumulator += capped;
-        let step = 70.0;
-        if self.scroll_accumulator.abs() < step {
-            return;
-        }
-        let now = Instant::now();
-        if now.saturating_duration_since(self.last_scroll_nav) < Duration::from_millis(140) {
-            return;
-        }
-        let action = if self.scroll_accumulator > 0.0 {
-            Action::PrevItem
-        } else {
-            Action::NextItem
-        };
-        self.scroll_accumulator = 0.0;
-        self.last_scroll_nav = now;
-        self.apply_action(action);
-    }
-
     fn apply_action(&mut self, action: Action) {
         self.ui.record_interaction();
         match action {
@@ -1213,11 +1173,10 @@ fn fs_main(in: VertexOut) -> @location(0) vec4<f32> {
             }
             let current = feed.current_index;
             let position = indices.iter().position(|&idx| idx == current).unwrap_or(0);
-            let len = indices.len();
             let next_pos = if delta > 0 {
-                (position + 1) % len
+                (position + 1).min(indices.len().saturating_sub(1))
             } else {
-                (position + len - 1) % len
+                position.saturating_sub(1)
             };
             self.select_feed_index(indices[next_pos]);
             return;
@@ -1226,70 +1185,62 @@ fn fs_main(in: VertexOut) -> @location(0) vec4<f32> {
     }
 
     fn navigate_feed(&mut self, delta: i32) {
-        let has_selection = {
+        let load_result = {
             let Some(feed) = self.feed.as_mut() else {
                 return;
             };
 
-            if delta > 0 {
+            let has_selection = if delta > 0 {
                 feed.next().is_some()
             } else if delta < 0 {
                 feed.prev().is_some()
             } else {
                 feed.current().is_some()
+            };
+
+            if has_selection {
+                Some(feed.build_runtime_for_current())
+            } else {
+                None
             }
         };
 
-        if !has_selection {
-            return;
-        }
-
-        self.unload_runtime();
-        let result = self
-            .feed
-            .as_ref()
-            .and_then(|feed| feed.build_runtime_for_current().ok());
-        match result {
-            Some(load) => {
-                self.apply_runtime_load(load);
-                self.feed_error = None;
-                if let Some(feed) = self.feed.as_ref() {
-                    feed.prefetch_neighbors();
+        if let Some(result) = load_result {
+            match result {
+                Ok(load) => {
+                    self.apply_runtime_load(load);
+                    self.feed_error = None;
+                    if let Some(feed) = self.feed.as_ref() {
+                        feed.prefetch_neighbors();
+                    }
                 }
-            }
-            None => {
-                self.feed_error = Some("Load feed item failed.".to_string());
+                Err(err) => self.feed_error = Some(format!("Load feed item failed: {err}")),
             }
         }
     }
 
     fn select_feed_index(&mut self, index: usize) {
-        let has_selection = {
+        let load_result = {
             let Some(feed) = self.feed.as_mut() else {
                 return;
             };
-            feed.select(index).is_some()
+            if feed.select(index).is_some() {
+                Some(feed.build_runtime_for_current())
+            } else {
+                None
+            }
         };
 
-        if !has_selection {
-            return;
-        }
-
-        self.unload_runtime();
-        let result = self
-            .feed
-            .as_ref()
-            .and_then(|feed| feed.build_runtime_for_current().ok());
-        match result {
-            Some(load) => {
-                self.apply_runtime_load(load);
-                self.feed_error = None;
-                if let Some(feed) = self.feed.as_ref() {
-                    feed.prefetch_neighbors();
+        if let Some(result) = load_result {
+            match result {
+                Ok(load) => {
+                    self.apply_runtime_load(load);
+                    self.feed_error = None;
+                    if let Some(feed) = self.feed.as_ref() {
+                        feed.prefetch_neighbors();
+                    }
                 }
-            }
-            None => {
-                self.feed_error = Some("Load feed item failed.".to_string());
+                Err(err) => self.feed_error = Some(format!("Load feed item failed: {err}")),
             }
         }
     }
@@ -1300,13 +1251,6 @@ fn fs_main(in: VertexOut) -> @location(0) vec4<f32> {
         self.runtime = Some(load.runtime);
         self.accumulator = 0.0;
         self.ui.trigger_transition();
-    }
-
-    fn unload_runtime(&mut self) {
-        self.audio_stream = None;
-        self.runtime_meta = None;
-        self.runtime = None;
-        self.accumulator = 0.0;
     }
 
     fn create_byte(&mut self) {
@@ -1753,7 +1697,10 @@ fn system_from_rom_path(path: &PathBuf) -> System {
         .and_then(|ext| ext.to_str())
         .map(|ext| ext.to_lowercase())
     {
+        Some(ext) if ext == "gba" => System::Gba,
+        Some(ext) if ext == "gb" || ext == "gbc" => System::Gbc,
         Some(ext) if ext == "sfc" || ext == "smc" => System::Snes,
+        Some(ext) if ext == "nes" => System::Nes,
         _ => System::Nes,
     }
 }
@@ -1838,9 +1785,6 @@ fn main() -> Result<()> {
                         let pressed = event.state == ElementState::Pressed;
                         state.handle_keyboard(code, pressed);
                     }
-                }
-                WindowEvent::MouseWheel { delta, .. } => {
-                    state.handle_scroll(&delta);
                 }
                 _ => {}
             },

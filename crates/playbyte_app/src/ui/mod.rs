@@ -36,7 +36,6 @@ pub struct UiState {
     toasts: Vec<Toast>,
     thumbnails: ThumbnailCache,
     transition_start: Option<Instant>,
-    search_focused: bool,
 }
 
 impl UiState {
@@ -52,42 +51,25 @@ impl UiState {
             toasts: Vec::new(),
             thumbnails: ThumbnailCache::new(64),
             transition_start: None,
-            search_focused: false,
         }
     }
 
     pub fn render(&mut self, ctx: &egui::Context, data: UiContext<'_>) -> UiOutput {
         let mut actions = Vec::new();
         let now = Instant::now();
-        self.search_focused = false;
 
-        let mut details_visible = false;
         if self.overlay_visible {
             self.render_top_bar(ctx, &data, &mut actions);
-            details_visible = self.should_show_details(now);
-            self.render_library(ctx, &data, &mut actions, details_visible);
+            self.render_library(ctx, &data, &mut actions);
         } else {
             self.render_minimal_overlay(ctx);
         }
 
         if self.should_show_hint(now) {
-            let offset = if self.overlay_visible {
-                if details_visible {
-                    -260.0
-                } else {
-                    -170.0
-                }
-            } else {
-                -24.0
-            };
             egui::Area::new(egui::Id::new("controls_hint"))
-                .anchor(egui::Align2::CENTER_BOTTOM, [0.0, offset])
+                .anchor(egui::Align2::CENTER_BOTTOM, [0.0, -24.0])
                 .show(ctx, |ui| {
-                    hint_strip(
-                        ui,
-                        "Swipe trackpad or L2/R2 to browse • B to bookmark • Tab to hide",
-                        &self.theme,
-                    );
+                    hint_strip(ui, "Swipe trackpad or L2/R2 to browse • B to bookmark • Tab to hide", &self.theme);
                 });
         }
 
@@ -121,15 +103,8 @@ impl UiState {
         self.filter != LibraryFilter::All || !self.search_query.trim().is_empty()
     }
 
-    fn should_show_details(&self, now: Instant) -> bool {
-        if self.search_focused || self.is_filtering() {
-            return true;
-        }
-        now.saturating_duration_since(self.last_interaction) < Duration::from_secs(6)
-    }
-
     pub fn filtered_indices(&self, feed: &FeedController) -> Vec<usize> {
-        feed.items()
+        feed.items
             .iter()
             .enumerate()
             .filter_map(|(idx, item)| {
@@ -143,10 +118,17 @@ impl UiState {
     }
 
     fn matches_filter(&self, item: &crate::FeedItem) -> bool {
-        if self.filter == LibraryFilter::Nes && item.system() != System::Nes {
+        let system = item.system();
+        if self.filter == LibraryFilter::Nes && system != System::Nes {
             return false;
         }
-        if self.filter == LibraryFilter::Snes && item.system() != System::Snes {
+        if self.filter == LibraryFilter::Snes && system != System::Snes {
+            return false;
+        }
+        if self.filter == LibraryFilter::Gbc && system != System::Gbc {
+            return false;
+        }
+        if self.filter == LibraryFilter::Gba && system != System::Gba {
             return false;
         }
         let query = self.search_query.trim().to_lowercase();
@@ -165,9 +147,8 @@ impl UiState {
                 in_title || in_id || in_tags || in_description
             }
             crate::FeedItem::RomFallback(fallback) => {
-                let in_title = fallback.title.to_lowercase().contains(&query);
-                let in_id = fallback.rom_sha1.to_lowercase().contains(&query);
-                in_title || in_id
+                fallback.title.to_lowercase().contains(&query)
+                    || fallback.rom_sha1.to_lowercase().contains(&query)
             }
         }
     }
@@ -178,105 +159,89 @@ impl UiState {
         data: &UiContext<'_>,
         actions: &mut Vec<Action>,
     ) {
-        let screen_width = ctx.screen_rect().width();
-        let panel_width = (screen_width - 32.0).max(320.0).min(screen_width);
-        egui::Area::new(egui::Id::new("top_bar"))
-            .anchor(egui::Align2::CENTER_TOP, [0.0, 14.0])
-            .show(ctx, |ui| {
-                ui.set_min_width(panel_width);
+        egui::TopBottomPanel::top("top_bar")
+            .frame(
                 egui::Frame::none()
                     .fill(self.theme.panel)
-                    .rounding(egui::Rounding::same(16.0))
-                    .inner_margin(egui::Margin::symmetric(16.0, 10.0))
-                    .show(ui, |ui| {
-                        ui.spacing_mut().item_spacing = egui::vec2(10.0, 8.0);
-                        ui.horizontal(|ui| {
-                            ui.label(
-                                egui::RichText::new("Playbyte")
-                                    .color(self.theme.text)
-                                    .size(20.0)
-                                    .strong(),
-                            );
-                            ui.add_space(8.0);
-                            if let Some(fps) = data.frame_stats.avg_fps() {
-                                ui.label(
-                                    egui::RichText::new(format!("{fps:.0} fps"))
-                                        .color(self.theme.text_dim)
-                                        .size(12.0),
-                                );
-                            }
-                            if let Some(runtime) = &data.runtime {
-                                ui.label(
-                                    egui::RichText::new(format!("emu {:.1} Hz", runtime.fps()))
-                                        .color(self.theme.text_dim)
-                                        .size(12.0),
-                                );
-                            }
-                            if let Some(feed) = data.feed {
-                                ui.label(
-                                    egui::RichText::new(format!("{} items", feed.item_count()))
-                                        .color(self.theme.text_dim)
-                                        .size(12.0),
-                                );
-                            }
+                    .inner_margin(egui::Margin::symmetric(20.0, 14.0)),
+            )
+            .show(ctx, |ui| {
+                ui.horizontal(|ui| {
+                    ui.label(
+                        egui::RichText::new("Playbyte")
+                            .color(self.theme.text)
+                            .size(24.0)
+                            .strong(),
+                    );
+                    ui.add_space(12.0);
+                    if let Some(fps) = data.frame_stats.avg_fps() {
+                        ui.label(
+                            egui::RichText::new(format!("{fps:.0} fps"))
+                                .color(self.theme.text_dim),
+                        );
+                    }
+                    if let Some(runtime) = &data.runtime {
+                        ui.label(
+                            egui::RichText::new(format!("emu {:.1} Hz", runtime.fps()))
+                                .color(self.theme.text_dim),
+                        );
+                    }
+                    if let Some(feed) = data.feed {
+                        ui.label(
+                            egui::RichText::new(format!("{} items", feed.items.len()))
+                                .color(self.theme.text_dim),
+                        );
+                    }
 
-                            ui.with_layout(
-                                egui::Layout::right_to_left(egui::Align::Center),
-                                |ui| {
-                                    if data.runtime.is_some() {
-                                        if primary_button(ui, "Bookmark", &self.theme).clicked() {
-                                            actions.push(Action::CreateByte);
-                                            self.record_interaction();
-                                        }
-                                    }
-                                    ui.add_space(10.0);
-                                    let search = ui.add(
-                                        egui::TextEdit::singleline(&mut self.search_query)
-                                            .hint_text("Search titles, tags…")
-                                            .desired_width(200.0),
-                                    );
-                                    self.search_focused = search.has_focus();
-                                    if search.changed() {
-                                        self.record_interaction();
-                                    }
-                                    ui.add_space(8.0);
-                                    if pill_button(
-                                        ui,
-                                        "All",
-                                        self.filter == LibraryFilter::All,
-                                        &self.theme,
-                                    )
-                                    .clicked()
-                                    {
-                                        self.filter = LibraryFilter::All;
-                                        self.record_interaction();
-                                    }
-                                    if pill_button(
-                                        ui,
-                                        "NES",
-                                        self.filter == LibraryFilter::Nes,
-                                        &self.theme,
-                                    )
-                                    .clicked()
-                                    {
-                                        self.filter = LibraryFilter::Nes;
-                                        self.record_interaction();
-                                    }
-                                    if pill_button(
-                                        ui,
-                                        "SNES",
-                                        self.filter == LibraryFilter::Snes,
-                                        &self.theme,
-                                    )
-                                    .clicked()
-                                    {
-                                        self.filter = LibraryFilter::Snes;
-                                        self.record_interaction();
-                                    }
-                                },
-                            );
-                        });
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if data.runtime.is_some() {
+                            if primary_button(ui, "Bookmark Byte", &self.theme).clicked() {
+                                actions.push(Action::CreateByte);
+                                self.record_interaction();
+                            }
+                        }
+                        ui.add_space(12.0);
+                        let search = ui.add(
+                            egui::TextEdit::singleline(&mut self.search_query)
+                                .hint_text("Search titles, tags…")
+                                .desired_width(220.0),
+                        );
+                        if search.changed() {
+                            self.record_interaction();
+                        }
+                        ui.add_space(10.0);
+                        if pill_button(ui, "All", self.filter == LibraryFilter::All, &self.theme)
+                            .clicked()
+                        {
+                            self.filter = LibraryFilter::All;
+                            self.record_interaction();
+                        }
+                        if pill_button(ui, "NES", self.filter == LibraryFilter::Nes, &self.theme)
+                            .clicked()
+                        {
+                            self.filter = LibraryFilter::Nes;
+                            self.record_interaction();
+                        }
+                        if pill_button(ui, "SNES", self.filter == LibraryFilter::Snes, &self.theme)
+                            .clicked()
+                        {
+                            self.filter = LibraryFilter::Snes;
+                            self.record_interaction();
+                        }
+                        if pill_button(ui, "GBC", self.filter == LibraryFilter::Gbc, &self.theme)
+                            .clicked()
+                        {
+                            self.filter = LibraryFilter::Gbc;
+                            self.record_interaction();
+                        }
+                        if pill_button(ui, "GBA", self.filter == LibraryFilter::Gba, &self.theme)
+                            .clicked()
+                        {
+                            self.filter = LibraryFilter::Gba;
+                            self.record_interaction();
+                        }
                     });
+                });
             });
     }
 
@@ -285,251 +250,169 @@ impl UiState {
         ctx: &egui::Context,
         data: &UiContext<'_>,
         actions: &mut Vec<Action>,
-        details_visible: bool,
     ) {
-        let screen_width = ctx.screen_rect().width();
-        let panel_width = (screen_width - 32.0).max(320.0).min(screen_width);
-        egui::Area::new(egui::Id::new("library_panel"))
-            .anchor(egui::Align2::CENTER_BOTTOM, [0.0, -18.0])
-            .show(ctx, |ui| {
-                ui.set_min_width(panel_width);
-                let panel = egui::Frame::none()
+        egui::CentralPanel::default()
+            .frame(
+                egui::Frame::none()
                     .fill(self.theme.panel)
-                    .rounding(egui::Rounding::same(18.0))
-                    .inner_margin(egui::Margin::symmetric(18.0, 14.0))
-                    .show(ui, |ui| {
-                        ui.spacing_mut().item_spacing = egui::vec2(10.0, 8.0);
-                        if let Some(feed) = data.feed {
-                            if let Some(current) = feed.current() {
-                                if details_visible {
-                                    let preview_width =
-                                        (panel_width * 0.32).clamp(240.0, 360.0);
-                                    let preview_size =
-                                        egui::Vec2::new(preview_width, preview_width * 0.6);
+                    .inner_margin(egui::Margin::symmetric(24.0, 20.0)),
+            )
+            .show(ctx, |ui| {
+                if let Some(feed) = data.feed {
+                    if let Some(current) = feed.current() {
+                        ui.horizontal(|ui| {
+                            let thumb = match current {
+                                crate::FeedItem::Byte(byte) => {
+                                    self.thumbnails.get(ctx, &feed.store, byte)
+                                }
+                                crate::FeedItem::RomFallback(_) => None,
+                            };
+                            hero_preview(
+                                ui,
+                                thumb.as_ref(),
+                                egui::Vec2::new(360.0, 220.0),
+                                &self.theme,
+                            );
+                            ui.add_space(18.0);
+                            ui.vertical(|ui| {
+                                let title = current.title();
+                                ui.label(
+                                    egui::RichText::new(title)
+                                        .size(26.0)
+                                        .strong()
+                                        .color(self.theme.text),
+                                );
+                                ui.add_space(6.0);
+                                ui.horizontal(|ui| {
+                                    let system_label = match current.system() {
+                                        System::Nes => "NES",
+                                        System::Snes => "SNES",
+                                        System::Gbc => "GBC",
+                                        System::Gba => "GBA",
+                                    };
+                                    badge(ui, system_label, self.theme.accent_soft, self.theme.text);
+                                    if let crate::FeedItem::Byte(byte) = current {
+                                        for tag in byte.tags.iter().take(3) {
+                                            badge(ui, tag, self.theme.panel_alt, self.theme.text_dim);
+                                        }
+                                    }
+                                });
+                                ui.add_space(8.0);
+                                let description = match current {
+                                    crate::FeedItem::Byte(byte) => {
+                                        if byte.description.is_empty() {
+                                            "No description yet."
+                                        } else {
+                                            byte.description.as_str()
+                                        }
+                                    }
+                                    crate::FeedItem::RomFallback(_) => {
+                                        "ROM not bookmarked yet. Press B to create a Byte."
+                                    }
+                                };
+                                ui.label(
+                                    egui::RichText::new(description)
+                                        .color(self.theme.text_dim)
+                                        .size(15.0),
+                                );
+                                ui.add_space(8.0);
+                                match current {
+                                    crate::FeedItem::Byte(byte) => {
+                                        ui.label(
+                                            egui::RichText::new(format!(
+                                                "Saved by {} • {}",
+                                                byte.author, byte.created_at
+                                            ))
+                                            .color(self.theme.text_dim)
+                                            .size(13.0),
+                                        );
+                                    }
+                                    crate::FeedItem::RomFallback(fallback) => {
+                                        let filename = fallback
+                                            .rom_path
+                                            .file_name()
+                                            .and_then(|name| name.to_str())
+                                            .unwrap_or("ROM");
+                                        ui.label(
+                                            egui::RichText::new(format!("Local ROM • {filename}"))
+                                                .color(self.theme.text_dim)
+                                                .size(13.0),
+                                        );
+                                    }
+                                }
+                            });
+                        });
+
+                        if let Some(error) = data.feed_error {
+                            ui.add_space(12.0);
+                            ui.colored_label(self.theme.error, error);
+                        }
+
+                        ui.add_space(20.0);
+                        ui.label(
+                            egui::RichText::new("Library")
+                                .color(self.theme.text_dim)
+                                .size(14.0)
+                                .strong(),
+                        );
+                        ui.add_space(8.0);
+                        let indices = self.filtered_indices(feed);
+                        if indices.is_empty() {
+                            ui.label(
+                                egui::RichText::new("No items match your filters.")
+                                    .color(self.theme.text_dim),
+                            );
+                        } else {
+                            egui::ScrollArea::horizontal()
+                                .id_source("library_scroll")
+                                .auto_shrink([false; 2])
+                                .show(ui, |ui| {
                                     ui.horizontal(|ui| {
-                                        let thumb = match current {
-                                            crate::FeedItem::Byte(byte) => {
-                                                self.thumbnails.get(ctx, &feed.store, byte)
+                                        for idx in indices {
+                                            let item = &feed.items[idx];
+                                            let selected = idx == feed.current_index;
+                                            let anim = ui
+                                                .ctx()
+                                                .animate_bool(egui::Id::new(("card", idx)), selected);
+                                            let thumb = match item {
+                                                crate::FeedItem::Byte(byte) => {
+                                                    self.thumbnails.get(ctx, &feed.store, byte)
+                                                }
+                                                crate::FeedItem::RomFallback(_) => None,
+                                            };
+                                            let response = library_card(
+                                                ui,
+                                                item,
+                                                thumb.as_ref(),
+                                                selected,
+                                                anim,
+                                                egui::Vec2::new(200.0, 140.0),
+                                                &self.theme,
+                                            );
+                                            if response.clicked() {
+                                                actions.push(Action::SelectIndex(idx));
+                                                self.record_interaction();
                                             }
-                                            crate::FeedItem::RomFallback(_) => None,
-                                        };
-                                        hero_preview(ui, thumb.as_ref(), preview_size, &self.theme);
-                                        ui.add_space(12.0);
-                                        match current {
-                                            crate::FeedItem::Byte(byte) => {
-                                                ui.vertical(|ui| {
-                                                    let title = if byte.title.is_empty() {
-                                                        &byte.byte_id
-                                                    } else {
-                                                        &byte.title
-                                                    };
-                                                    ui.label(
-                                                        egui::RichText::new(title)
-                                                            .size(22.0)
-                                                            .strong()
-                                                            .color(self.theme.text),
-                                                    );
-                                                    ui.add_space(4.0);
-                                                    ui.horizontal(|ui| {
-                                                        let (system_label, system_color) =
-                                                            match byte.system {
-                                                                System::Nes => {
-                                                                    ("NES", self.theme.system_nes)
-                                                                }
-                                                                System::Snes => (
-                                                                    "SNES",
-                                                                    self.theme.system_snes,
-                                                                ),
-                                                            };
-                                                        badge(
-                                                            ui,
-                                                            system_label,
-                                                            system_color,
-                                                            self.theme.text_on_accent,
-                                                        );
-                                                        for tag in byte.tags.iter().take(2) {
-                                                            badge(
-                                                                ui,
-                                                                tag,
-                                                                self.theme.panel_alt,
-                                                                self.theme.text_dim,
-                                                            );
-                                                        }
-                                                    });
-                                                    ui.add_space(6.0);
-                                                    let description = if byte.description.is_empty()
-                                                    {
-                                                        "No description yet."
-                                                    } else {
-                                                        byte.description.as_str()
-                                                    };
-                                                    ui.label(
-                                                        egui::RichText::new(description)
-                                                            .color(self.theme.text_dim)
-                                                            .size(14.0),
-                                                    );
-                                                    ui.add_space(4.0);
-                                                    ui.label(
-                                                        egui::RichText::new(format!(
-                                                            "Saved by {} • {}",
-                                                            byte.author, byte.created_at
-                                                        ))
-                                                        .color(self.theme.text_dim)
-                                                        .size(12.0),
-                                                    );
-                                                });
-                                            }
-                                            crate::FeedItem::RomFallback(fallback) => {
-                                                ui.vertical(|ui| {
-                                                    ui.label(
-                                                        egui::RichText::new(&fallback.title)
-                                                            .size(22.0)
-                                                            .strong()
-                                                            .color(self.theme.text),
-                                                    );
-                                                    ui.add_space(4.0);
-                                                    ui.horizontal(|ui| {
-                                                        let (system_label, system_color) =
-                                                            match fallback.system {
-                                                                System::Nes => {
-                                                                    ("NES", self.theme.system_nes)
-                                                                }
-                                                                System::Snes => (
-                                                                    "SNES",
-                                                                    self.theme.system_snes,
-                                                                ),
-                                                            };
-                                                        badge(
-                                                            ui,
-                                                            system_label,
-                                                            system_color,
-                                                            self.theme.text_on_accent,
-                                                        );
-                                                        badge(
-                                                            ui,
-                                                            "Default",
-                                                            self.theme.panel_alt,
-                                                            self.theme.text_dim,
-                                                        );
-                                                    });
-                                                    ui.add_space(6.0);
-                                                    ui.label(
-                                                        egui::RichText::new(
-                                                            "Default ROM state. Bookmark to save a Byte.",
-                                                        )
-                                                        .color(self.theme.text_dim)
-                                                        .size(14.0),
-                                                    );
-                                                });
+                                            if selected {
+                                                ui.scroll_to_rect(response.rect, Some(egui::Align::Center));
                                             }
                                         }
                                     });
-                                    ui.add_space(12.0);
-                                }
-
-                                if let Some(error) = data.feed_error {
-                                    ui.colored_label(self.theme.error, error);
-                                    ui.add_space(8.0);
-                                }
-
-                                let indices = self.filtered_indices(feed);
-                                ui.horizontal(|ui| {
-                                    ui.label(
-                                        egui::RichText::new("Library")
-                                            .color(self.theme.text_dim)
-                                            .size(12.0)
-                                            .strong(),
-                                    );
-                                    ui.add_space(8.0);
-                                    let count_label = if self.is_filtering() {
-                                        format!("{} of {}", indices.len(), feed.item_count())
-                                    } else {
-                                        format!("{} items", feed.item_count())
-                                    };
-                                    ui.label(
-                                        egui::RichText::new(count_label)
-                                            .color(self.theme.text_dim)
-                                            .size(12.0),
-                                    );
                                 });
-                                ui.add_space(6.0);
-                                if indices.is_empty() {
-                                    ui.label(
-                                        egui::RichText::new("No items match your filters.")
-                                            .color(self.theme.text_dim),
-                                    );
-                                } else {
-                                    egui::ScrollArea::horizontal()
-                                        .id_source("library_scroll")
-                                        .auto_shrink([false; 2])
-                                        .show(ui, |ui| {
-                                            ui.horizontal(|ui| {
-                                                for idx in indices {
-                                                    let item = &feed.items()[idx];
-                                                    let selected = idx == feed.current_index;
-                                                    let anim = ui.ctx().animate_bool(
-                                                        egui::Id::new(("card", idx)),
-                                                        selected,
-                                                    );
-                                                    let thumb = match item {
-                                                        crate::FeedItem::Byte(byte) => {
-                                                            self.thumbnails.get(
-                                                                ctx,
-                                                                &feed.store,
-                                                                byte,
-                                                            )
-                                                        }
-                                                        crate::FeedItem::RomFallback(_) => None,
-                                                    };
-                                                    let response = library_card(
-                                                        ui,
-                                                        item.title(),
-                                                        item.system(),
-                                                        thumb.as_ref(),
-                                                        selected,
-                                                        anim,
-                                                        egui::Vec2::new(180.0, 120.0),
-                                                        &self.theme,
-                                                    );
-                                                    if response.clicked() {
-                                                        actions.push(Action::SelectIndex(idx));
-                                                        self.record_interaction();
-                                                    }
-                                                    if selected {
-                                                        ui.scroll_to_rect(
-                                                            response.rect,
-                                                            Some(egui::Align::Center),
-                                                        );
-                                                    }
-                                                }
-                                            });
-                                        });
-                                }
-                            } else {
-                                if let Some(error) = data.feed_error {
-                                    ui.colored_label(self.theme.error, error);
-                                    ui.add_space(6.0);
-                                }
-                                ui.label(
-                                    egui::RichText::new("No feed items available yet.")
-                                        .color(self.theme.text_dim),
-                                );
-                            }
-                        } else {
-                            if let Some(error) = data.feed_error {
-                                ui.colored_label(self.theme.error, error);
-                                ui.add_space(6.0);
-                            }
-                            ui.label(
-                                egui::RichText::new(
-                                    "No feed loaded. Pass --core and --rom, or add ROMs/Bytes in your data folder (see --data).",
-                                )
-                                .color(self.theme.text_dim),
-                            );
                         }
-                    });
-                if panel.response.hovered() {
-                    self.record_interaction();
+                    } else {
+                        ui.label(
+                            egui::RichText::new("No Bytes found in data/bytes.")
+                                .color(self.theme.text_dim),
+                        );
+                    }
+                } else {
+                    ui.label(
+                        egui::RichText::new(
+                            "No feed loaded. Pass --core and --rom or add Bytes in ./data/bytes.",
+                        )
+                        .color(self.theme.text_dim),
+                    );
                 }
             });
     }
@@ -540,12 +423,12 @@ impl UiState {
             .show(ctx, |ui| {
                 ui.label(
                     egui::RichText::new("Playbyte")
-                        .size(18.0)
+                        .size(20.0)
                         .color(self.theme.text),
                 );
                 ui.label(
                     egui::RichText::new("Press Tab to show library")
-                        .size(12.0)
+                        .size(13.0)
                         .color(self.theme.text_dim),
                 );
             });
@@ -600,6 +483,8 @@ enum LibraryFilter {
     All,
     Nes,
     Snes,
+    Gbc,
+    Gba,
 }
 
 struct Toast {
@@ -610,8 +495,11 @@ struct Toast {
 
 pub(super) struct UiTheme {
     accent: egui::Color32,
+    accent_soft: egui::Color32,
     system_nes: egui::Color32,
     system_snes: egui::Color32,
+    system_gbc: egui::Color32,
+    system_gba: egui::Color32,
     panel: egui::Color32,
     panel_alt: egui::Color32,
     card: egui::Color32,
@@ -628,13 +516,16 @@ impl UiTheme {
     fn default() -> Self {
         Self {
             accent: egui::Color32::from_rgb(77, 133, 255),
+            accent_soft: egui::Color32::from_rgb(43, 61, 102),
             system_nes: egui::Color32::from_rgb(64, 196, 255),
             system_snes: egui::Color32::from_rgb(176, 124, 255),
-            panel: egui::Color32::from_rgba_unmultiplied(14, 16, 20, 190),
-            panel_alt: egui::Color32::from_rgba_unmultiplied(26, 30, 38, 200),
-            card: egui::Color32::from_rgba_unmultiplied(22, 26, 34, 220),
-            card_selected: egui::Color32::from_rgba_unmultiplied(30, 36, 48, 230),
-            card_border: egui::Color32::from_rgba_unmultiplied(44, 52, 66, 200),
+            system_gbc: egui::Color32::from_rgb(96, 206, 142),
+            system_gba: egui::Color32::from_rgb(248, 156, 90),
+            panel: egui::Color32::from_rgba_unmultiplied(14, 16, 20, 210),
+            panel_alt: egui::Color32::from_rgba_unmultiplied(26, 30, 38, 220),
+            card: egui::Color32::from_rgba_unmultiplied(22, 26, 34, 230),
+            card_selected: egui::Color32::from_rgba_unmultiplied(30, 36, 48, 235),
+            card_border: egui::Color32::from_rgba_unmultiplied(44, 52, 66, 220),
             text: egui::Color32::from_rgb(232, 234, 240),
             text_dim: egui::Color32::from_rgb(162, 170, 184),
             text_on_accent: egui::Color32::from_rgb(240, 246, 255),
@@ -648,23 +539,23 @@ fn apply_theme(ctx: &egui::Context, theme: &UiTheme) {
     let mut style = (*ctx.style()).clone();
     style.visuals = egui::Visuals::dark();
     style.visuals.panel_fill = theme.panel;
-    style.visuals.window_rounding = egui::Rounding::same(14.0);
-    style.visuals.widgets.inactive.rounding = egui::Rounding::same(10.0);
-    style.visuals.widgets.hovered.rounding = egui::Rounding::same(10.0);
-    style.visuals.widgets.active.rounding = egui::Rounding::same(10.0);
-    style.spacing.item_spacing = egui::vec2(10.0, 8.0);
-    style.spacing.button_padding = egui::vec2(10.0, 5.0);
+    style.visuals.window_rounding = egui::Rounding::same(16.0);
+    style.visuals.widgets.inactive.rounding = egui::Rounding::same(12.0);
+    style.visuals.widgets.hovered.rounding = egui::Rounding::same(12.0);
+    style.visuals.widgets.active.rounding = egui::Rounding::same(12.0);
+    style.spacing.item_spacing = egui::vec2(12.0, 10.0);
+    style.spacing.button_padding = egui::vec2(12.0, 6.0);
     style.text_styles.insert(
         egui::TextStyle::Heading,
-        egui::FontId::new(24.0, egui::FontFamily::Proportional),
+        egui::FontId::new(26.0, egui::FontFamily::Proportional),
     );
     style.text_styles.insert(
         egui::TextStyle::Body,
-        egui::FontId::new(15.0, egui::FontFamily::Proportional),
+        egui::FontId::new(16.0, egui::FontFamily::Proportional),
     );
     style.text_styles.insert(
         egui::TextStyle::Small,
-        egui::FontId::new(12.0, egui::FontFamily::Proportional),
+        egui::FontId::new(13.0, egui::FontFamily::Proportional),
     );
     ctx.set_style(style);
 

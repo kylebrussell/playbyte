@@ -223,15 +223,15 @@ impl RomLibrary {
         self.index.get(sha1).cloned()
     }
 
-    pub fn roots(&self) -> &[PathBuf] {
-        &self.roots
-    }
-
     pub fn entries(&self) -> Vec<(String, PathBuf)> {
         self.index
             .iter()
-            .map(|(hash, path)| (hash.clone(), path.clone()))
+            .map(|(sha1, path)| (sha1.clone(), path.clone()))
             .collect()
+    }
+
+    pub fn roots(&self) -> &[PathBuf] {
+        &self.roots
     }
 }
 
@@ -290,7 +290,13 @@ impl RemoteByteStore {
 fn is_rom_file(path: &Path) -> bool {
     matches!(
         path.extension().and_then(|ext| ext.to_str()).map(|ext| ext.to_lowercase()),
-        Some(ext) if ext == "nes" || ext == "sfc" || ext == "smc"
+        Some(ext)
+            if ext == "nes"
+                || ext == "sfc"
+                || ext == "smc"
+                || ext == "gb"
+                || ext == "gbc"
+                || ext == "gba"
     )
 }
 

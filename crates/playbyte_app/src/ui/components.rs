@@ -6,7 +6,7 @@ use playbyte_types::System;
 pub fn badge(ui: &mut egui::Ui, label: &str, fill: Color32, text: Color32) -> Response {
     egui::Frame::none()
         .fill(fill)
-        .rounding(Rounding::same(8.0))
+        .rounding(Rounding::same(10.0))
         .inner_margin(egui::Margin::symmetric(8.0, 3.0))
         .show(ui, |ui| {
             ui.label(
@@ -38,8 +38,8 @@ pub fn pill_button(
     egui::Frame::none()
         .fill(fill)
         .rounding(Rounding::same(999.0))
-        .inner_margin(egui::Margin::symmetric(12.0, 5.0))
-        .show(ui, |ui| ui.label(egui::RichText::new(label).color(text).size(12.0)))
+        .inner_margin(egui::Margin::symmetric(14.0, 6.0))
+        .show(ui, |ui| ui.label(egui::RichText::new(label).color(text)))
         .response
         .on_hover_cursor(egui::CursorIcon::PointingHand)
 }
@@ -47,23 +47,16 @@ pub fn pill_button(
 pub fn primary_button(ui: &mut egui::Ui, label: &str, theme: &UiTheme) -> Response {
     egui::Frame::none()
         .fill(theme.accent)
-        .rounding(Rounding::same(10.0))
-        .inner_margin(egui::Margin::symmetric(12.0, 6.0))
-        .show(ui, |ui| {
-            ui.label(
-                egui::RichText::new(label)
-                    .color(theme.text_on_accent)
-                    .size(13.0),
-            )
-        })
+        .rounding(Rounding::same(12.0))
+        .inner_margin(egui::Margin::symmetric(14.0, 8.0))
+        .show(ui, |ui| ui.label(egui::RichText::new(label).color(theme.text_on_accent)))
         .response
         .on_hover_cursor(egui::CursorIcon::PointingHand)
 }
 
 pub fn library_card(
     ui: &mut egui::Ui,
-    title: &str,
-    system: System,
+    item: &crate::FeedItem,
     thumb: Option<&Thumbnail>,
     selected: bool,
     anim: f32,
@@ -73,17 +66,17 @@ pub fn library_card(
     let (rect, response) = ui.allocate_exact_size(size, Sense::click());
     let draw_rect = Rect::from_center_size(
         rect.center(),
-        Vec2::new(size.x * lerp(0.96, 1.02, anim), size.y * lerp(0.96, 1.02, anim)),
+        Vec2::new(size.x * lerp(0.94, 1.02, anim), size.y * lerp(0.94, 1.02, anim)),
     );
 
     let fill = if selected { theme.card_selected } else { theme.card };
     let stroke = Stroke::new(1.0, theme.card_border);
-    let rounding = Rounding::same(16.0);
-    let shadow_rect = draw_rect.translate(Vec2::new(0.0, 6.0));
+    let rounding = Rounding::same(18.0);
+    let shadow_rect = draw_rect.translate(Vec2::new(0.0, 8.0));
     ui.painter().rect_filled(
         shadow_rect,
         rounding,
-        Color32::from_black_alpha(80),
+        Color32::from_black_alpha(100),
     );
     ui.painter().rect_filled(draw_rect, rounding, fill);
     ui.painter().rect_stroke(draw_rect, rounding, stroke);
@@ -92,11 +85,11 @@ pub fn library_card(
         ui.painter().rect_stroke(
             draw_rect,
             rounding,
-            Stroke::new(1.2, theme.accent),
+            Stroke::new(1.5, theme.accent),
         );
     }
 
-    let image_rect = draw_rect.shrink(8.0);
+    let image_rect = draw_rect.shrink(10.0);
     if let Some(thumb) = thumb {
         let fitted = fit_aspect(thumb.size, image_rect);
         ui.painter().image(
@@ -110,13 +103,15 @@ pub fn library_card(
             .rect_filled(image_rect, rounding, theme.panel_alt);
     }
 
-    let (system_label, system_color) = match system {
+    let (system_label, system_color) = match item.system() {
         System::Nes => ("NES", theme.system_nes),
         System::Snes => ("SNES", theme.system_snes),
+        System::Gbc => ("GBC", theme.system_gbc),
+        System::Gba => ("GBA", theme.system_gba),
     };
     let badge_rect = Rect::from_min_size(
         Pos2::new(draw_rect.left() + 12.0, draw_rect.top() + 12.0),
-        Vec2::new(48.0, 18.0),
+        Vec2::new(52.0, 20.0),
     );
     ui.painter()
         .rect_filled(badge_rect, Rounding::same(6.0), system_color);
@@ -124,16 +119,17 @@ pub fn library_card(
         badge_rect.center(),
         Align2::CENTER_CENTER,
         system_label,
-        FontId::new(10.0, egui::FontFamily::Proportional),
+        FontId::new(11.0, egui::FontFamily::Proportional),
         theme.text_on_accent,
     );
 
-    let title_pos = Pos2::new(draw_rect.left() + 14.0, draw_rect.bottom() - 22.0);
+    let title = item.title();
+    let title_pos = Pos2::new(draw_rect.left() + 14.0, draw_rect.bottom() - 26.0);
     ui.painter().text(
         title_pos,
         Align2::LEFT_CENTER,
         title,
-        FontId::new(14.0, egui::FontFamily::Proportional),
+        FontId::new(15.0, egui::FontFamily::Proportional),
         theme.text,
     );
 
@@ -147,10 +143,10 @@ pub fn hero_preview(
     theme: &UiTheme,
 ) -> Response {
     let (rect, response) = ui.allocate_exact_size(size, Sense::hover());
-    let rounding = Rounding::same(18.0);
+    let rounding = Rounding::same(22.0);
     ui.painter().rect_filled(rect, rounding, theme.panel_alt);
     if let Some(thumb) = thumb {
-        let fitted = fit_aspect(thumb.size, rect.shrink(6.0));
+        let fitted = fit_aspect(thumb.size, rect.shrink(8.0));
         ui.painter().image(
             thumb.id,
             fitted,
@@ -164,23 +160,17 @@ pub fn hero_preview(
 pub fn toast(ui: &mut egui::Ui, text: &str, fill: Color32, text_color: Color32) {
     egui::Frame::none()
         .fill(fill)
-        .rounding(Rounding::same(12.0))
-        .inner_margin(egui::Margin::symmetric(12.0, 8.0))
+        .rounding(Rounding::same(14.0))
+        .inner_margin(egui::Margin::symmetric(14.0, 10.0))
         .show(ui, |ui| ui.label(egui::RichText::new(text).color(text_color)));
 }
 
 pub fn hint_strip(ui: &mut egui::Ui, text: &str, theme: &UiTheme) {
     egui::Frame::none()
         .fill(theme.panel_alt)
-        .rounding(Rounding::same(14.0))
-        .inner_margin(egui::Margin::symmetric(14.0, 8.0))
-        .show(ui, |ui| {
-            ui.label(
-                egui::RichText::new(text)
-                    .color(theme.text_dim)
-                    .size(12.0),
-            )
-        });
+        .rounding(Rounding::same(16.0))
+        .inner_margin(egui::Margin::symmetric(18.0, 10.0))
+        .show(ui, |ui| ui.label(egui::RichText::new(text).color(theme.text_dim)));
 }
 
 fn fit_aspect(image_size: Vec2, bounds: Rect) -> Rect {

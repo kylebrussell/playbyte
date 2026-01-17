@@ -5,6 +5,8 @@ use serde::{Deserialize, Serialize};
 pub enum System {
     Nes,
     Snes,
+    Gbc,
+    Gba,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
