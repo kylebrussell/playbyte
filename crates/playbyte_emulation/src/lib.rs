@@ -123,6 +123,12 @@ impl AudioRingBuffer {
 pub enum RuntimeError {
     #[error(transparent)]
     Libretro(#[from] LibretroError),
+    #[error("ROM extension '.{rom_ext}' not supported by core '{core}' (valid extensions: {valid_extensions})")]
+    IncompatibleRom {
+        core: String,
+        rom_ext: String,
+        valid_extensions: String,
+    },
 }
 
 pub struct EmulatorRuntime {
@@ -138,6 +144,12 @@ impl EmulatorRuntime {
         core_path: impl AsRef<Path>,
         rom_path: impl AsRef<Path>,
     ) -> Result<Self, RuntimeError> {
+        let rom_extension = rom_path
+            .as_ref()
+            .extension()
+            .and_then(|ext| ext.to_str())
+            .map(|ext| ext.to_ascii_lowercase());
+
         let latest_frame = Arc::new(Mutex::new(None));
         let latest_frame_cb = Arc::clone(&latest_frame);
 
@@ -149,7 +161,8 @@ impl EmulatorRuntime {
 
         let callbacks = Callbacks::new(
             Box::new(move |data, width, height, pitch, format| {
-                let mut guard = latest_frame_cb.lock().expect("latest frame lock poisoned");
+                let mut guard =
+                    latest_frame_cb.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
                 *guard = Some(VideoFrame {
                     width,
                     height,
@@ -166,15 +179,29 @@ impl EmulatorRuntime {
                 if port != 0 || device != RETRO_DEVICE_JOYPAD {
                     return 0;
                 }
-                let guard = input_cb.lock().expect("input lock poisoned");
+                let guard = input_cb.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
                 guard.value_for_id(id)
             }),
         );
 
+        if let Some(ext) = rom_extension.as_deref() {
+            let info = LibretroCore::probe_system_info(core_path.as_ref())?;
+            if !core_supports_extension(&info.valid_extensions, ext) {
+                return Err(RuntimeError::IncompatibleRom {
+                    core: info.library_name.clone(),
+                    rom_ext: ext.to_string(),
+                    valid_extensions: info.valid_extensions.clone(),
+                });
+            }
+        }
+
         let mut core = LibretroCore::load(core_path, callbacks)?;
         core.load_game(rom_path)?;
         let av_info = core.system_av_info();
-        let fps = if av_info.timing.fps > 0.0 {
+        let fps = if av_info.timing.fps.is_finite()
+            && av_info.timing.fps >= 1.0
+            && av_info.timing.fps <= 240.0
+        {
             av_info.timing.fps
         } else {
             60.0
@@ -227,4 +254,21 @@ impl EmulatorRuntime {
     pub fn unserialize(&self, data: &[u8]) -> Result<(), RuntimeError> {
         Ok(self.core.unserialize(data)?)
     }
+}
+
+fn core_supports_extension(valid_extensions: &str, rom_ext: &str) -> bool {
+    let rom_ext = rom_ext.trim().trim_start_matches('.').to_ascii_lowercase();
+    if rom_ext.is_empty() {
+        return true;
+    }
+
+    let valid = valid_extensions.trim();
+    if valid.is_empty() || valid == "*" {
+        return true;
+    }
+
+    valid
+        .split(|ch: char| ch == '|' || ch == ',' || ch == ';' || ch.is_whitespace())
+        .filter(|part| !part.is_empty())
+        .any(|part| part.eq_ignore_ascii_case(&rom_ext))
 }

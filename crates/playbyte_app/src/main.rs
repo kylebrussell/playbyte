@@ -292,7 +292,12 @@ impl CoreLocator {
         if candidate.exists() {
             Some(candidate)
         } else {
-            None
+            let by_ext = self.root.join(format!("{core_id}.{ext}"));
+            if by_ext.exists() {
+                Some(by_ext)
+            } else {
+                None
+            }
         }
     }
 }
@@ -618,19 +623,30 @@ fn list_core_ids(root: &PathBuf) -> Vec<String> {
     let Ok(entries) = fs::read_dir(root) else {
         return cores;
     };
+    let ext = if cfg!(target_os = "windows") {
+        "dll"
+    } else if cfg!(target_os = "macos") {
+        "dylib"
+    } else {
+        "so"
+    };
     for entry in entries.flatten() {
         if let Ok(file_type) = entry.file_type() {
-            if !file_type.is_file() {
+            if !(file_type.is_file() || file_type.is_symlink()) {
                 continue;
             }
         }
-        let Some(name) = entry.file_name().to_str().map(|value| value.to_string()) else {
+        let path = entry.path();
+        let matches_ext = path
+            .extension()
+            .and_then(|value| value.to_str())
+            .map(|value| value.eq_ignore_ascii_case(ext))
+            .unwrap_or(false);
+        if !matches_ext {
             continue;
-        };
-        if let Some((core_id, _)) = name.split_once("_libretro.") {
-            if !core_id.is_empty() {
-                cores.push(core_id.to_string());
-            }
+        }
+        if let Some(core_id) = core_id_from_path(&path) {
+            cores.push(core_id);
         }
     }
     cores.sort();
@@ -686,7 +702,7 @@ fn select_default_core(
         }
     }
 
-    available_cores.first().cloned()
+    None
 }
 
 struct VideoTexture {
@@ -1101,6 +1117,8 @@ fn fs_main(in: VertexOut) -> @location(0) vec4<f32> {
         if let Some(runtime) = self.runtime.as_mut() {
             self.accumulator += dt.as_secs_f64();
             let frame_time = 1.0 / runtime.fps();
+            let frame_time = frame_time.max(1.0 / 1000.0);
+            self.accumulator = self.accumulator.min(frame_time * 5.0);
             while self.accumulator >= frame_time {
                 runtime.run_frame();
                 self.accumulator -= frame_time;

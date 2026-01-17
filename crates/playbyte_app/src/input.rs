@@ -1,13 +1,14 @@
 use gilrs::Button;
 use winit::keyboard::KeyCode;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Action {
     NextItem,
     PrevItem,
     ToggleOverlay,
     CreateByte,
     SelectIndex(usize),
+    RenameTitle { index: usize, title: String },
 }
 
 #[derive(Debug, Clone)]

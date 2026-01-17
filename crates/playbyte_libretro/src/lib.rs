@@ -16,9 +16,9 @@ const RETRO_ENVIRONMENT_SET_PIXEL_FORMAT: u32 = 10;
 #[repr(u32)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RetroPixelFormat {
-    Xrgb8888 = 0,
-    Rgb565 = 1,
-    _0rgb1555 = 2,
+    _0rgb1555 = 0,
+    Xrgb8888 = 1,
+    Rgb565 = 2,
 }
 
 #[repr(C)]
@@ -176,21 +176,23 @@ impl Callbacks {
             audio_sample_batch,
             input_poll,
             input_state,
-            pixel_format: Mutex::new(RetroPixelFormat::Xrgb8888),
+            pixel_format: Mutex::new(RetroPixelFormat::_0rgb1555),
         }
     }
 
     fn set_pixel_format(&self, format: RetroPixelFormat) {
-        if let Ok(mut guard) = self.pixel_format.lock() {
-            *guard = format;
-        }
+        let mut guard = self
+            .pixel_format
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        *guard = format;
     }
 
     fn pixel_format(&self) -> RetroPixelFormat {
-        self.pixel_format
+        *self
+            .pixel_format
             .lock()
-            .map(|guard| *guard)
-            .unwrap_or(RetroPixelFormat::Xrgb8888)
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
     }
 }
 
@@ -224,7 +226,10 @@ fn with_callbacks<F, R>(f: F) -> Option<R>
 where
     F: FnOnce(&Callbacks) -> R,
 {
-    let callbacks = callbacks_cell().lock().ok()?.clone();
+    let callbacks = callbacks_cell()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .clone();
     callbacks.as_deref().map(f)
 }
 
@@ -244,7 +249,7 @@ unsafe extern "C" fn environment_callback(cmd: u32, data: *mut c_void) -> bool {
             let format = *(data as *const RetroPixelFormat);
             let supported = matches!(
                 format,
-                RetroPixelFormat::Xrgb8888 | RetroPixelFormat::Rgb565
+                RetroPixelFormat::_0rgb1555 | RetroPixelFormat::Xrgb8888 | RetroPixelFormat::Rgb565
             );
             if supported {
                 let _ = with_callbacks(|callbacks| callbacks.set_pixel_format(format));
@@ -316,6 +321,21 @@ pub struct LibretroCore {
 }
 
 impl LibretroCore {
+    pub fn probe_system_info(path: impl AsRef<Path>) -> Result<SystemInfo, LibretroError> {
+        let lib = unsafe { Library::new(path.as_ref())? };
+        let symbols = unsafe { Symbols::load(&lib)? };
+
+        let api_version = unsafe { (symbols.retro_api_version)() };
+        if api_version != RETRO_API_VERSION {
+            return Err(LibretroError::ApiVersion {
+                expected: RETRO_API_VERSION,
+                actual: api_version,
+            });
+        }
+
+        unsafe { Self::read_system_info(&symbols) }
+    }
+
     pub fn load(path: impl AsRef<Path>, callbacks: Callbacks) -> Result<Self, LibretroError> {
         let lib = unsafe { Library::new(path.as_ref())? };
         let symbols = unsafe { Symbols::load(&lib)? };
@@ -329,7 +349,10 @@ impl LibretroCore {
         }
 
         let callbacks = Arc::new(callbacks);
-        if let Ok(mut guard) = callbacks_cell().lock() {
+        {
+            let mut guard = callbacks_cell()
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
             *guard = Some(callbacks.clone());
         }
 
@@ -344,7 +367,19 @@ impl LibretroCore {
         }
 
         let system_info = unsafe { Self::read_system_info(&symbols)? };
-        let system_av_info = unsafe { Self::read_system_av_info(&symbols) };
+        let system_av_info = SystemAvInfo {
+            geometry: RetroGameGeometry {
+                base_width: 0,
+                base_height: 0,
+                max_width: 0,
+                max_height: 0,
+                aspect_ratio: 0.0,
+            },
+            timing: RetroSystemTiming {
+                fps: 0.0,
+                sample_rate: 0.0,
+            },
+        };
 
         Ok(Self {
             _lib: lib,
@@ -388,6 +423,7 @@ impl LibretroCore {
         if !ok {
             return Err(LibretroError::LoadGame);
         }
+        self.system_av_info = unsafe { Self::read_system_av_info(&self.symbols) };
         self.game_loaded = true;
         self.loaded_game = Some(loaded_game);
         Ok(())
@@ -497,7 +533,7 @@ pub fn smoke_test(
     let capture = last_frame.clone();
     let callbacks = Callbacks::new(
         Box::new(move |data, width, height, pitch, format| {
-            let mut guard = capture.lock().expect("frame lock poisoned");
+            let mut guard = capture.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
             *guard = Some(VideoFrame {
                 width,
                 height,
