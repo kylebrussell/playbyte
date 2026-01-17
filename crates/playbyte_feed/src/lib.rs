@@ -44,6 +44,10 @@ impl LocalByteStore {
         self.root.join("bytes")
     }
 
+    fn rom_titles_path(&self) -> PathBuf {
+        self.root.join("rom_titles.json")
+    }
+
     pub fn load_index(&self) -> Result<Vec<ByteMetadata>, FeedError> {
         let bytes_root = self.bytes_root();
         if !bytes_root.exists() {
@@ -158,6 +162,47 @@ impl LocalByteStore {
             guard.push(metadata.clone());
         }
 
+        Ok(())
+    }
+
+    pub fn update_metadata(&self, metadata: &ByteMetadata) -> Result<(), FeedError> {
+        let byte_dir = self.bytes_root().join(&metadata.byte_id);
+        fs::create_dir_all(&byte_dir)?;
+        let metadata_path = byte_dir.join("byte.json");
+        let serialized = serde_json::to_string_pretty(metadata)?;
+        fs::write(metadata_path, serialized)?;
+
+        if let Ok(mut guard) = self.index.lock() {
+            if let Some(entry) = guard.iter_mut().find(|entry| entry.byte_id == metadata.byte_id) {
+                *entry = metadata.clone();
+            } else {
+                guard.push(metadata.clone());
+            }
+        }
+
+        Ok(())
+    }
+
+    pub fn load_rom_titles(&self) -> Result<HashMap<String, String>, FeedError> {
+        let path = self.rom_titles_path();
+        if !path.exists() {
+            return Ok(HashMap::new());
+        }
+        let data = fs::read_to_string(path)?;
+        Ok(serde_json::from_str(&data)?)
+    }
+
+    pub fn set_rom_title(&self, sha1: &str, title: &str) -> Result<(), FeedError> {
+        let mut titles = self.load_rom_titles()?;
+        let trimmed = title.trim();
+        if trimmed.is_empty() {
+            titles.remove(sha1);
+        } else {
+            titles.insert(sha1.to_string(), trimmed.to_string());
+        }
+        fs::create_dir_all(&self.root)?;
+        let serialized = serde_json::to_string_pretty(&titles)?;
+        fs::write(self.rom_titles_path(), serialized)?;
         Ok(())
     }
 

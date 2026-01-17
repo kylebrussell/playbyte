@@ -19,31 +19,6 @@ pub fn badge(ui: &mut egui::Ui, label: &str, fill: Color32, text: Color32) -> Re
         .response
 }
 
-pub fn pill_button(
-    ui: &mut egui::Ui,
-    label: &str,
-    selected: bool,
-    theme: &UiTheme,
-) -> Response {
-    let fill = if selected {
-        theme.accent
-    } else {
-        theme.panel_alt
-    };
-    let text = if selected {
-        theme.text_on_accent
-    } else {
-        theme.text
-    };
-    egui::Frame::none()
-        .fill(fill)
-        .rounding(Rounding::same(999.0))
-        .inner_margin(egui::Margin::symmetric(14.0, 6.0))
-        .show(ui, |ui| ui.label(egui::RichText::new(label).color(text)))
-        .response
-        .on_hover_cursor(egui::CursorIcon::PointingHand)
-}
-
 pub fn primary_button(ui: &mut egui::Ui, label: &str, theme: &UiTheme) -> Response {
     egui::Frame::none()
         .fill(theme.accent)
@@ -124,9 +99,13 @@ pub fn library_card(
     );
 
     let title = item.title();
-    let title_pos = Pos2::new(draw_rect.left() + 14.0, draw_rect.bottom() - 26.0);
-    ui.painter().text(
-        title_pos,
+    let title_rect = Rect::from_min_max(
+        Pos2::new(draw_rect.left() + 14.0, draw_rect.bottom() - 40.0),
+        Pos2::new(draw_rect.right() - 12.0, draw_rect.bottom() - 12.0),
+    );
+    let title_painter = ui.painter().with_clip_rect(title_rect);
+    title_painter.text(
+        Pos2::new(title_rect.left(), title_rect.center().y),
         Align2::LEFT_CENTER,
         title,
         FontId::new(15.0, egui::FontFamily::Proportional),

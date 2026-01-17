@@ -362,13 +362,14 @@ impl FeedController {
     fn load(config: &AppConfig) -> Result<Self> {
         let store = LocalByteStore::new(&config.data_root);
         let bytes = store.load_index()?;
+        let rom_titles = store.load_rom_titles()?;
 
         let mut roms = RomLibrary::new();
         roms.add_root(&config.rom_root);
         let _ = roms.scan()?;
 
         let core_locator = CoreLocator::new(config.cores_root.clone());
-        let items = build_feed_items(&core_locator, &roms, &bytes)?;
+        let items = build_feed_items(&core_locator, &roms, &bytes, &rom_titles)?;
 
         Ok(Self {
             store,
@@ -381,14 +382,6 @@ impl FeedController {
 
     fn is_empty(&self) -> bool {
         self.items.is_empty()
-    }
-
-    fn items(&self) -> &[FeedItem] {
-        &self.items
-    }
-
-    fn item_count(&self) -> usize {
-        self.items.len()
     }
 
     fn current(&self) -> Option<&FeedItem> {
@@ -534,7 +527,11 @@ impl FeedController {
             select_default_core(system.clone(), &available_cores, &bytes, &self.core_locator)
                 .ok_or_else(|| anyhow::anyhow!("no core available for fallback ROM"))?
         };
-        let title = title_from_rom_path(&rom_path);
+        let rom_titles = self.store.load_rom_titles()?;
+        let title = rom_titles
+            .get(&rom_sha1)
+            .cloned()
+            .unwrap_or_else(|| title_from_rom_path(&rom_path));
         self.items.push(FeedItem::RomFallback(RomFallback {
             rom_sha1,
             rom_path,
@@ -554,6 +551,7 @@ fn build_feed_items(
     core_locator: &CoreLocator,
     roms: &RomLibrary,
     bytes: &[ByteMetadata],
+    rom_titles: &HashMap<String, String>,
 ) -> Result<Vec<FeedItem>> {
     let mut items: Vec<FeedItem> = bytes.iter().cloned().map(FeedItem::Byte).collect();
     let mut covered_roms: HashSet<String> = bytes.iter().map(|byte| byte.rom_sha1.clone()).collect();
@@ -580,7 +578,10 @@ fn build_feed_items(
         let Some(core_id) = core_id else {
             continue;
         };
-        let title = title_from_rom_path(&rom_path);
+        let title = rom_titles
+            .get(&rom_sha1)
+            .cloned()
+            .unwrap_or_else(|| title_from_rom_path(&rom_path));
         items.push(FeedItem::RomFallback(RomFallback {
             rom_sha1: rom_sha1.clone(),
             rom_path,
@@ -637,6 +638,19 @@ fn list_core_ids(root: &PathBuf) -> Vec<String> {
     cores
 }
 
+fn core_id_matches_preference(core_id: &str, needle: &str) -> bool {
+    let core = core_id.to_ascii_lowercase();
+    let needle = needle.to_ascii_lowercase();
+    if core == needle {
+        return true;
+    }
+    // Avoid overly-broad matches like "nes" matching "bsnes".
+    if needle.len() < 4 {
+        return false;
+    }
+    core.contains(&needle)
+}
+
 fn select_default_core(
     system: System,
     available_cores: &[String],
@@ -666,7 +680,7 @@ fn select_default_core(
     for needle in preferred {
         if let Some(core_id) = available_cores
             .iter()
-            .find(|core| core.to_lowercase().contains(needle))
+            .find(|core| core_id_matches_preference(core, needle))
         {
             return Some(core_id.clone());
         }
@@ -1151,97 +1165,133 @@ fn fs_main(in: VertexOut) -> @location(0) vec4<f32> {
     fn apply_action(&mut self, action: Action) {
         self.ui.record_interaction();
         match action {
-            Action::NextItem => self.navigate_feed_filtered(1),
-            Action::PrevItem => self.navigate_feed_filtered(-1),
+            Action::NextItem => self.navigate_feed(1),
+            Action::PrevItem => self.navigate_feed(-1),
             Action::SelectIndex(index) => self.select_feed_index(index),
             Action::CreateByte => self.create_byte(),
+            Action::RenameTitle { index, title } => self.rename_feed_title(index, title),
             Action::ToggleOverlay => self.ui.toggle_overlay(),
         }
     }
 
-    fn navigate_feed_filtered(&mut self, delta: i32) {
-        let Some(feed) = self.feed.as_ref() else {
+    fn rename_feed_title(&mut self, index: usize, title: String) {
+        let Some(feed) = self.feed.as_mut() else {
             return;
         };
-        if delta == 0 {
+        let Some(item) = feed.items.get(index).cloned() else {
             return;
-        }
-        if self.ui.is_filtering() {
-            let indices = self.ui.filtered_indices(feed);
-            if indices.is_empty() {
-                return;
+        };
+        let store = feed.store.clone();
+        let trimmed = title.trim();
+        match item {
+            FeedItem::Byte(mut byte) => {
+                byte.title = trimmed.to_string();
+                if let Err(err) = store.update_metadata(&byte) {
+                    let message = format!("Rename failed: {err}");
+                    self.feed_error = Some(message.clone());
+                    self.ui.push_toast(ui::ToastKind::Error, message);
+                    return;
+                }
+                feed.items[index] = FeedItem::Byte(byte);
             }
-            let current = feed.current_index;
-            let position = indices.iter().position(|&idx| idx == current).unwrap_or(0);
-            let next_pos = if delta > 0 {
-                (position + 1).min(indices.len().saturating_sub(1))
-            } else {
-                position.saturating_sub(1)
-            };
-            self.select_feed_index(indices[next_pos]);
-            return;
+            FeedItem::RomFallback(mut fallback) => {
+                if let Err(err) = store.set_rom_title(&fallback.rom_sha1, trimmed) {
+                    let message = format!("Rename failed: {err}");
+                    self.feed_error = Some(message.clone());
+                    self.ui.push_toast(ui::ToastKind::Error, message);
+                    return;
+                }
+                fallback.title = if trimmed.is_empty() {
+                    title_from_rom_path(&fallback.rom_path)
+                } else {
+                    trimmed.to_string()
+                };
+                feed.items[index] = FeedItem::RomFallback(fallback);
+            }
         }
-        self.navigate_feed(delta);
+        self.feed_error = None;
+        self.ui
+            .push_toast(ui::ToastKind::Success, "Title updated".to_string());
     }
 
     fn navigate_feed(&mut self, delta: i32) {
-        let load_result = {
+        let has_selection = {
             let Some(feed) = self.feed.as_mut() else {
                 return;
             };
 
-            let has_selection = if delta > 0 {
+            if delta > 0 {
                 feed.next().is_some()
             } else if delta < 0 {
                 feed.prev().is_some()
             } else {
                 feed.current().is_some()
-            };
-
-            if has_selection {
-                Some(feed.build_runtime_for_current())
-            } else {
-                None
             }
         };
 
-        if let Some(result) = load_result {
-            match result {
-                Ok(load) => {
-                    self.apply_runtime_load(load);
-                    self.feed_error = None;
-                    if let Some(feed) = self.feed.as_ref() {
-                        feed.prefetch_neighbors();
-                    }
+        if !has_selection {
+            return;
+        }
+
+        // Libretro cores (and our callback wiring) are effectively single-instance.
+        // Drop the current runtime BEFORE constructing the next one to avoid
+        // shared-global-state cores (e.g. bsnes) corrupting each other during swaps.
+        self.audio_stream = None;
+        self.runtime = None;
+        self.runtime_meta = None;
+
+        let result = {
+            let Some(feed) = self.feed.as_ref() else {
+                return;
+            };
+            feed.build_runtime_for_current()
+        };
+
+        match result {
+            Ok(load) => {
+                self.apply_runtime_load(load);
+                self.feed_error = None;
+                if let Some(feed) = self.feed.as_ref() {
+                    feed.prefetch_neighbors();
                 }
-                Err(err) => self.feed_error = Some(format!("Load feed item failed: {err}")),
             }
+            Err(err) => self.feed_error = Some(format!("Load feed item failed: {err}")),
         }
     }
 
     fn select_feed_index(&mut self, index: usize) {
-        let load_result = {
+        let selected = {
             let Some(feed) = self.feed.as_mut() else {
                 return;
             };
-            if feed.select(index).is_some() {
-                Some(feed.build_runtime_for_current())
-            } else {
-                None
-            }
+            feed.select(index).is_some()
         };
 
-        if let Some(result) = load_result {
-            match result {
-                Ok(load) => {
-                    self.apply_runtime_load(load);
-                    self.feed_error = None;
-                    if let Some(feed) = self.feed.as_ref() {
-                        feed.prefetch_neighbors();
-                    }
+        if !selected {
+            return;
+        }
+
+        // See note in `navigate_feed`.
+        self.audio_stream = None;
+        self.runtime = None;
+        self.runtime_meta = None;
+
+        let result = {
+            let Some(feed) = self.feed.as_ref() else {
+                return;
+            };
+            feed.build_runtime_for_current()
+        };
+
+        match result {
+            Ok(load) => {
+                self.apply_runtime_load(load);
+                self.feed_error = None;
+                if let Some(feed) = self.feed.as_ref() {
+                    feed.prefetch_neighbors();
                 }
-                Err(err) => self.feed_error = Some(format!("Load feed item failed: {err}")),
             }
+            Err(err) => self.feed_error = Some(format!("Load feed item failed: {err}")),
         }
     }
 
@@ -1603,12 +1653,28 @@ fn map_keycode(key: KeyCode) -> Option<u32> {
 fn convert_frame_to_rgba(frame: &playbyte_libretro::VideoFrame) -> Vec<u8> {
     let width = frame.width as usize;
     let height = frame.height as usize;
+    if width == 0 || height == 0 {
+        return Vec::new();
+    }
     let mut out = vec![0u8; width * height * 4];
+
+    let bytes_per_pixel = match frame.pixel_format {
+        playbyte_libretro::RetroPixelFormat::Xrgb8888 => 4,
+        playbyte_libretro::RetroPixelFormat::Rgb565 | playbyte_libretro::RetroPixelFormat::_0rgb1555 => 2,
+    };
+    let min_pitch = width.saturating_mul(bytes_per_pixel);
+    if frame.pitch < min_pitch {
+        return out;
+    }
+    if frame.data.len() < frame.pitch.saturating_mul(height) {
+        return out;
+    }
 
     match frame.pixel_format {
         playbyte_libretro::RetroPixelFormat::Xrgb8888 => {
             for y in 0..height {
-                let row = &frame.data[y * frame.pitch..y * frame.pitch + width * 4];
+                let row_start = y * frame.pitch;
+                let row = &frame.data[row_start..row_start + min_pitch];
                 for x in 0..width {
                     let src = x * 4;
                     let dst = (y * width + x) * 4;
@@ -1624,7 +1690,8 @@ fn convert_frame_to_rgba(frame: &playbyte_libretro::VideoFrame) -> Vec<u8> {
         }
         playbyte_libretro::RetroPixelFormat::Rgb565 => {
             for y in 0..height {
-                let row = &frame.data[y * frame.pitch..y * frame.pitch + width * 2];
+                let row_start = y * frame.pitch;
+                let row = &frame.data[row_start..row_start + min_pitch];
                 for x in 0..width {
                     let src = x * 2;
                     let value = u16::from_le_bytes([row[src], row[src + 1]]);
@@ -1641,7 +1708,8 @@ fn convert_frame_to_rgba(frame: &playbyte_libretro::VideoFrame) -> Vec<u8> {
         }
         playbyte_libretro::RetroPixelFormat::_0rgb1555 => {
             for y in 0..height {
-                let row = &frame.data[y * frame.pitch..y * frame.pitch + width * 2];
+                let row_start = y * frame.pitch;
+                let row = &frame.data[row_start..row_start + min_pitch];
                 for x in 0..width {
                     let src = x * 2;
                     let value = u16::from_le_bytes([row[src], row[src + 1]]);
