@@ -1,8 +1,8 @@
 # Playbyte
 
-Playbyte is an open-source, native app that presents a TikTok-like feed of
-game save states ("Bytes"). Each feed item is a savestate that instantly loads
-into an emulator, so you can jump straight into the action.
+Playbyte is an open-source, native app for browsing and playing game save
+states ("Bytes"). A carousel at the bottom lets you flip through Bytes—each
+one instantly loads into an emulator, so you can jump straight into the action.
 
 ## Status
 
@@ -10,7 +10,7 @@ Playbyte is an early prototype and is under active development.
 
 ## Features
 
-- TikTok-like feed UI for browsing and launching Bytes (savestates).
+- Carousel UI for browsing and launching Bytes (savestates).
 - Local, offline-first Byte storage.
 - Supported systems: **NES**, **SNES**, **GBC**, **GBA** (via libretro cores).
 - ROM library scanning by SHA-1 (Bytes reference ROM hashes; ROMs are never shipped).
