@@ -1,8 +1,10 @@
 mod components;
+mod cover_art;
 mod thumbnails;
 
 use crate::{FeedController, FrameStats};
 use components::{badge, hero_preview, hint_strip, library_card, primary_button, toast};
+use cover_art::CoverArtCache;
 use playbyte_emulation::EmulatorRuntime;
 use playbyte_types::System;
 use std::time::{Duration, Instant};
@@ -33,10 +35,12 @@ pub struct UiState {
     last_interaction: Instant,
     toasts: Vec<Toast>,
     thumbnails: ThumbnailCache,
+    covers: CoverArtCache,
     transition_start: Option<Instant>,
     rename_target: Option<usize>,
     rename_draft: String,
     last_centered_index: Option<usize>,
+    official_picker: Option<OfficialPickerState>,
 }
 
 impl UiState {
@@ -49,10 +53,12 @@ impl UiState {
             last_interaction: Instant::now(),
             toasts: Vec::new(),
             thumbnails: ThumbnailCache::new(64),
+            covers: CoverArtCache::new(64),
             transition_start: None,
             rename_target: None,
             rename_draft: String::new(),
             last_centered_index: None,
+            official_picker: None,
         }
     }
 
@@ -75,6 +81,7 @@ impl UiState {
                 });
         }
 
+        self.render_official_picker(ctx, &mut actions);
         self.render_toasts(ctx, now);
         self.render_transition(ctx, now);
 
@@ -103,6 +110,32 @@ impl UiState {
 
     pub fn is_editing_text(&self) -> bool {
         self.rename_target.is_some()
+    }
+
+    pub fn invalidate_cover_art(&mut self, rom_sha1: &str) {
+        self.covers.invalidate(rom_sha1);
+    }
+
+    fn open_official_picker(
+        &mut self,
+        index: usize,
+        fallback: &crate::RomFallback,
+        store: &playbyte_feed::LocalByteStore,
+    ) {
+        let titles = store
+            .list_romdb_titles(fallback.system.clone())
+            .unwrap_or_default();
+        let normalized_titles = titles
+            .iter()
+            .map(|title| normalize_picker_query(title))
+            .collect();
+        self.official_picker = Some(OfficialPickerState {
+            index,
+            system: fallback.system.clone(),
+            titles,
+            normalized_titles,
+            query: String::new(),
+        });
     }
 
     fn render_top_bar(
@@ -184,7 +217,9 @@ impl UiState {
                                 crate::FeedItem::Byte(byte) => {
                                     self.thumbnails.get(ctx, &feed.store, byte)
                                 }
-                                crate::FeedItem::RomFallback(_) => None,
+                                crate::FeedItem::RomFallback(fallback) => {
+                                    self.covers.get(ctx, &feed.store, fallback)
+                                }
                             };
                             hero_preview(
                                 ui,
@@ -317,7 +352,9 @@ impl UiState {
                                             crate::FeedItem::Byte(byte) => {
                                                 self.thumbnails.get(ctx, &feed.store, byte)
                                             }
-                                            crate::FeedItem::RomFallback(_) => None,
+                                            crate::FeedItem::RomFallback(fallback) => {
+                                                self.covers.get(ctx, &feed.store, fallback)
+                                            }
                                         };
                                         let response = library_card(
                                             ui,
@@ -335,6 +372,18 @@ impl UiState {
                                                 actions.push(Action::SelectIndex(idx));
                                                 self.record_interaction();
                                                 ui.close_menu();
+                                            }
+                                            if let crate::FeedItem::RomFallback(fallback) = item {
+                                                if ui.button("Choose official game...").clicked() {
+                                                    self.open_official_picker(
+                                                        idx,
+                                                        fallback,
+                                                        &feed.store,
+                                                    );
+                                                    actions.push(Action::SelectIndex(idx));
+                                                    self.record_interaction();
+                                                    ui.close_menu();
+                                                }
                                             }
                                         });
                                         if response.clicked() {
@@ -373,6 +422,62 @@ impl UiState {
                     );
                 }
             });
+    }
+
+    fn render_official_picker(&mut self, ctx: &egui::Context, actions: &mut Vec<Action>) {
+        let Some(state) = self.official_picker.as_mut() else {
+            return;
+        };
+        let mut close = false;
+        egui::Window::new("Choose official game")
+            .collapsible(false)
+            .resizable(false)
+            .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+            .show(ctx, |ui| {
+                let system_label = match state.system {
+                    System::Nes => "NES",
+                    System::Snes => "SNES",
+                    System::Gbc => "GBC",
+                    System::Gba => "GBA",
+                };
+                ui.label(format!("System: {system_label}"));
+                ui.add_space(6.0);
+                ui.label("Search official titles");
+                ui.text_edit_singleline(&mut state.query);
+                ui.add_space(8.0);
+                if state.titles.is_empty() {
+                    ui.label("No official database available.");
+                } else {
+                    let results = state.search_results(24);
+                    egui::ScrollArea::vertical()
+                        .max_height(260.0)
+                        .show(ui, |ui| {
+                            for idx in results {
+                                let title = &state.titles[idx];
+                                if ui.selectable_label(false, title).clicked() {
+                                    actions.push(Action::SetOfficialTitle {
+                                        index: state.index,
+                                        title: title.clone(),
+                                    });
+                                    close = true;
+                                }
+                            }
+                        });
+                }
+                ui.add_space(8.0);
+                ui.horizontal(|ui| {
+                    if ui.button("Clear override").clicked() {
+                        actions.push(Action::ClearOfficialTitle { index: state.index });
+                        close = true;
+                    }
+                    if ui.button("Cancel").clicked() {
+                        close = true;
+                    }
+                });
+            });
+        if close {
+            self.official_picker = None;
+        }
     }
 
     fn render_minimal_overlay(&self, ctx: &egui::Context) {
@@ -440,6 +545,64 @@ struct Toast {
     kind: ToastKind,
     message: String,
     created_at: Instant,
+}
+
+struct OfficialPickerState {
+    index: usize,
+    system: System,
+    titles: Vec<String>,
+    normalized_titles: Vec<String>,
+    query: String,
+}
+
+impl OfficialPickerState {
+    fn search_results(&self, limit: usize) -> Vec<usize> {
+        let query = normalize_picker_query(&self.query);
+        if query.is_empty() {
+            return (0..self.titles.len()).take(limit).collect();
+        }
+        let mut matches: Vec<(i32, usize)> = Vec::new();
+        for (idx, normalized) in self.normalized_titles.iter().enumerate() {
+            if normalized.contains(&query) {
+                let mut score = 400;
+                if normalized == &query {
+                    score = 1000;
+                } else if normalized.starts_with(&query) {
+                    score = 800;
+                }
+                score -= (normalized.len() as i32 - query.len() as i32).abs().min(200);
+                matches.push((score, idx));
+            }
+        }
+        matches.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| self.titles[a.1].cmp(&self.titles[b.1])));
+        matches
+            .into_iter()
+            .take(limit)
+            .map(|(_, idx)| idx)
+            .collect()
+    }
+}
+
+fn normalize_picker_query(text: &str) -> String {
+    let mut output = String::with_capacity(text.len());
+    let mut last_space = false;
+    for ch in text.chars() {
+        let normalized = if ch.is_ascii_alphanumeric() {
+            ch.to_ascii_lowercase()
+        } else {
+            ' '
+        };
+        if normalized == ' ' {
+            if !last_space {
+                output.push(' ');
+                last_space = true;
+            }
+        } else {
+            output.push(normalized);
+            last_space = false;
+        }
+    }
+    output.trim().to_string()
 }
 
 pub(super) struct UiTheme {

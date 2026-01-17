@@ -9,6 +9,8 @@ pub enum Action {
     CreateByte,
     SelectIndex(usize),
     RenameTitle { index: usize, title: String },
+    SetOfficialTitle { index: usize, title: String },
+    ClearOfficialTitle { index: usize },
 }
 
 #[derive(Debug, Clone)]

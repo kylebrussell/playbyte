@@ -328,6 +328,7 @@ struct RomFallback {
     rom_path: PathBuf,
     system: System,
     title: String,
+    official_title: Option<String>,
     core_id: String,
     core_path: Option<PathBuf>,
 }
@@ -368,13 +369,15 @@ impl FeedController {
         let store = LocalByteStore::new(&config.data_root);
         let bytes = store.load_index()?;
         let rom_titles = store.load_rom_titles()?;
+        let rom_overrides = store.load_rom_official_overrides()?;
 
         let mut roms = RomLibrary::new();
         roms.add_root(&config.rom_root);
         let _ = roms.scan()?;
 
         let core_locator = CoreLocator::new(config.cores_root.clone());
-        let items = build_feed_items(&core_locator, &roms, &bytes, &rom_titles)?;
+        let items =
+            build_feed_items(&store, &core_locator, &roms, &bytes, &rom_titles, &rom_overrides)?;
 
         Ok(Self {
             store,
@@ -533,15 +536,25 @@ impl FeedController {
                 .ok_or_else(|| anyhow::anyhow!("no core available for fallback ROM"))?
         };
         let rom_titles = self.store.load_rom_titles()?;
+        let rom_overrides = self.store.load_rom_official_overrides()?;
         let title = rom_titles
             .get(&rom_sha1)
             .cloned()
             .unwrap_or_else(|| title_from_rom_path(&rom_path));
+        let official_title = resolve_official_title(
+            &self.store,
+            &rom_sha1,
+            &rom_path,
+            system.clone(),
+            &title,
+            &rom_overrides,
+        );
         self.items.push(FeedItem::RomFallback(RomFallback {
             rom_sha1,
             rom_path,
             system,
             title,
+            official_title,
             core_id,
             core_path,
         }));
@@ -553,10 +566,12 @@ impl FeedController {
 }
 
 fn build_feed_items(
+    store: &LocalByteStore,
     core_locator: &CoreLocator,
     roms: &RomLibrary,
     bytes: &[ByteMetadata],
     rom_titles: &HashMap<String, String>,
+    rom_overrides: &HashMap<String, String>,
 ) -> Result<Vec<FeedItem>> {
     let mut items: Vec<FeedItem> = bytes.iter().cloned().map(FeedItem::Byte).collect();
     let mut covered_roms: HashSet<String> = bytes.iter().map(|byte| byte.rom_sha1.clone()).collect();
@@ -587,11 +602,20 @@ fn build_feed_items(
             .get(&rom_sha1)
             .cloned()
             .unwrap_or_else(|| title_from_rom_path(&rom_path));
+        let official_title = resolve_official_title(
+            store,
+            &rom_sha1,
+            &rom_path,
+            system.clone(),
+            &title,
+            rom_overrides,
+        );
         items.push(FeedItem::RomFallback(RomFallback {
             rom_sha1: rom_sha1.clone(),
             rom_path,
             system,
             title,
+            official_title,
             core_id,
             core_path: None,
         }));
@@ -606,6 +630,43 @@ fn title_from_rom_path(path: &Path) -> String {
         .and_then(|stem| stem.to_str())
         .map(|stem| stem.replace('_', " "))
         .unwrap_or_else(|| "Unknown ROM".to_string())
+}
+
+fn resolve_official_title(
+    store: &LocalByteStore,
+    rom_sha1: &str,
+    rom_path: &PathBuf,
+    system: System,
+    display_title: &str,
+    overrides: &HashMap<String, String>,
+) -> Option<String> {
+    if let Some(override_title) = overrides.get(rom_sha1) {
+        return Some(override_title.clone());
+    }
+
+    let db = store.load_romdb(system).ok()?;
+    if let Some(title) = db.title_for_sha1(rom_sha1) {
+        return Some(title.to_string());
+    }
+
+    if system == System::Snes {
+        if let Ok(Some(alt_sha1)) = hash_rom_without_snes_header(rom_path) {
+            if let Some(title) = db.title_for_sha1(&alt_sha1) {
+                return Some(title.to_string());
+            }
+        }
+    }
+
+    if let Some(title) = db.best_match(display_title) {
+        return Some(title);
+    }
+
+    let fallback = title_from_rom_path(rom_path);
+    if fallback != display_title {
+        return db.best_match(&fallback);
+    }
+
+    None
 }
 
 fn core_id_from_path(path: &PathBuf) -> Option<String> {
@@ -1191,6 +1252,8 @@ fn fs_main(in: VertexOut) -> @location(0) vec4<f32> {
             Action::SelectIndex(index) => self.select_feed_index(index),
             Action::CreateByte => self.create_byte(),
             Action::RenameTitle { index, title } => self.rename_feed_title(index, title),
+            Action::SetOfficialTitle { index, title } => self.set_official_title(index, title),
+            Action::ClearOfficialTitle { index } => self.clear_official_title(index),
             Action::ToggleOverlay => self.ui.toggle_overlay(),
         }
     }
@@ -1233,6 +1296,71 @@ fn fs_main(in: VertexOut) -> @location(0) vec4<f32> {
         self.feed_error = None;
         self.ui
             .push_toast(ui::ToastKind::Success, "Title updated".to_string());
+    }
+
+    fn set_official_title(&mut self, index: usize, title: String) {
+        let Some(feed) = self.feed.as_mut() else {
+            return;
+        };
+        let Some(item) = feed.items.get(index).cloned() else {
+            return;
+        };
+        let store = feed.store.clone();
+        let trimmed = title.trim();
+        match item {
+            FeedItem::RomFallback(mut fallback) => {
+                if let Err(err) = store.set_rom_official_override(&fallback.rom_sha1, Some(trimmed)) {
+                    let message = format!("Official game update failed: {err}");
+                    self.feed_error = Some(message.clone());
+                    self.ui.push_toast(ui::ToastKind::Error, message);
+                    return;
+                }
+                fallback.official_title = if trimmed.is_empty() {
+                    None
+                } else {
+                    Some(trimmed.to_string())
+                };
+                let rom_sha1 = fallback.rom_sha1.clone();
+                feed.items[index] = FeedItem::RomFallback(fallback);
+                self.ui.invalidate_cover_art(&rom_sha1);
+                self.feed_error = None;
+                self.ui.push_toast(
+                    ui::ToastKind::Success,
+                    "Official game updated".to_string(),
+                );
+            }
+            _ => {}
+        }
+    }
+
+    fn clear_official_title(&mut self, index: usize) {
+        let Some(feed) = self.feed.as_mut() else {
+            return;
+        };
+        let Some(item) = feed.items.get(index).cloned() else {
+            return;
+        };
+        let store = feed.store.clone();
+        match item {
+            FeedItem::RomFallback(mut fallback) => {
+                if let Err(err) = store.set_rom_official_override(&fallback.rom_sha1, None) {
+                    let message = format!("Official game update failed: {err}");
+                    self.feed_error = Some(message.clone());
+                    self.ui.push_toast(ui::ToastKind::Error, message);
+                    return;
+                }
+                fallback.official_title = None;
+                let rom_sha1 = fallback.rom_sha1.clone();
+                feed.items[index] = FeedItem::RomFallback(fallback);
+                self.ui.invalidate_cover_art(&rom_sha1);
+                self.feed_error = None;
+                self.ui.push_toast(
+                    ui::ToastKind::Success,
+                    "Official game cleared".to_string(),
+                );
+            }
+            _ => {}
+        }
     }
 
     fn navigate_feed(&mut self, delta: i32) {
@@ -1771,6 +1899,16 @@ fn build_runtime_meta_from_runtime(
         _rom_path: rom_path.clone(),
         system: system_from_rom_path(rom_path),
     })
+}
+
+fn hash_rom_without_snes_header(path: &PathBuf) -> Result<Option<String>> {
+    let data = fs::read(path)?;
+    if data.len() <= 512 || data.len() % 1024 != 512 {
+        return Ok(None);
+    }
+    let mut hasher = Sha1::new();
+    hasher.update(&data[512..]);
+    Ok(Some(format!("{:x}", hasher.finalize())))
 }
 
 fn hash_rom(path: &PathBuf) -> Result<String> {

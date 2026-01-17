@@ -1,4 +1,7 @@
-use playbyte_types::ByteMetadata;
+mod romdb;
+
+use playbyte_types::{ByteMetadata, System};
+use romdb::{build_thumbnail_url, cover_path, RomDatabase};
 use serde::Deserialize;
 use sha1::{Digest, Sha1};
 use std::{
@@ -28,6 +31,7 @@ pub struct LocalByteStore {
     index: Arc<Mutex<Vec<ByteMetadata>>>,
     state_cache: Arc<Mutex<HashMap<String, Arc<Vec<u8>>>>>,
     thumbnail_cache: Arc<Mutex<HashMap<String, Arc<Vec<u8>>>>>,
+    romdb_cache: Arc<Mutex<HashMap<System, RomDatabase>>>,
 }
 
 impl LocalByteStore {
@@ -37,6 +41,7 @@ impl LocalByteStore {
             index: Arc::new(Mutex::new(Vec::new())),
             state_cache: Arc::new(Mutex::new(HashMap::new())),
             thumbnail_cache: Arc::new(Mutex::new(HashMap::new())),
+            romdb_cache: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
@@ -46,6 +51,18 @@ impl LocalByteStore {
 
     fn rom_titles_path(&self) -> PathBuf {
         self.root.join("rom_titles.json")
+    }
+
+    fn rom_official_overrides_path(&self) -> PathBuf {
+        self.root.join("rom_official_overrides.json")
+    }
+
+    fn romdb_root(&self) -> PathBuf {
+        self.root.join("romdb")
+    }
+
+    fn covers_root(&self) -> PathBuf {
+        self.root.join("covers")
     }
 
     pub fn load_index(&self) -> Result<Vec<ByteMetadata>, FeedError> {
@@ -204,6 +221,75 @@ impl LocalByteStore {
         let serialized = serde_json::to_string_pretty(&titles)?;
         fs::write(self.rom_titles_path(), serialized)?;
         Ok(())
+    }
+
+    pub fn load_rom_official_overrides(&self) -> Result<HashMap<String, String>, FeedError> {
+        let path = self.rom_official_overrides_path();
+        if !path.exists() {
+            return Ok(HashMap::new());
+        }
+        let data = fs::read_to_string(path)?;
+        Ok(serde_json::from_str(&data)?)
+    }
+
+    pub fn set_rom_official_override(
+        &self,
+        sha1: &str,
+        title: Option<&str>,
+    ) -> Result<(), FeedError> {
+        let mut overrides = self.load_rom_official_overrides()?;
+        let trimmed = title.unwrap_or_default().trim();
+        if trimmed.is_empty() {
+            overrides.remove(sha1);
+        } else {
+            overrides.insert(sha1.to_string(), trimmed.to_string());
+        }
+        fs::create_dir_all(&self.root)?;
+        let serialized = serde_json::to_string_pretty(&overrides)?;
+        fs::write(self.rom_official_overrides_path(), serialized)?;
+        Ok(())
+    }
+
+    pub fn load_romdb(&self, system: System) -> Result<RomDatabase, FeedError> {
+        if let Ok(guard) = self.romdb_cache.lock() {
+            if let Some(db) = guard.get(&system) {
+                return Ok(db.clone());
+            }
+        }
+        let db = RomDatabase::load_or_fetch(system, &self.romdb_root())?;
+        if let Ok(mut guard) = self.romdb_cache.lock() {
+            guard.insert(system, db.clone());
+        }
+        Ok(db)
+    }
+
+    pub fn list_romdb_titles(&self, system: System) -> Result<Vec<String>, FeedError> {
+        let db = self.load_romdb(system)?;
+        Ok(db.titles().to_vec())
+    }
+
+    pub fn cover_art_path(&self, system: System, title: &str) -> PathBuf {
+        cover_path(&self.covers_root(), system, title)
+    }
+
+    pub fn load_cover_art(&self, system: System, title: &str) -> Result<Vec<u8>, FeedError> {
+        let path = self.cover_art_path(system, title);
+        Ok(fs::read(path)?)
+    }
+
+    pub fn ensure_cover_art(&self, system: System, title: &str) -> Result<PathBuf, FeedError> {
+        let path = self.cover_art_path(system, title);
+        if path.exists() {
+            return Ok(path);
+        }
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        let url = build_thumbnail_url(system, title);
+        let response = reqwest::blocking::get(url)?.error_for_status()?;
+        let bytes = response.bytes()?;
+        fs::write(&path, bytes)?;
+        Ok(path)
     }
 
     pub fn prefetch(&self, byte_ids: &[String]) {
