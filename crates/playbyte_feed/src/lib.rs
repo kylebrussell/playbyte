@@ -226,6 +226,13 @@ impl RomLibrary {
     pub fn roots(&self) -> &[PathBuf] {
         &self.roots
     }
+
+    pub fn entries(&self) -> Vec<(String, PathBuf)> {
+        self.index
+            .iter()
+            .map(|(hash, path)| (hash.clone(), path.clone()))
+            .collect()
+    }
 }
 
 #[derive(Debug, Deserialize)]

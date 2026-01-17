@@ -1,3 +1,7 @@
+mod dualsense;
+mod input;
+mod ui;
+
 use anyhow::{bail, Context, Result};
 use bytemuck::{Pod, Zeroable};
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
@@ -15,9 +19,9 @@ use playbyte_feed::{LocalByteStore, RomLibrary};
 use playbyte_types::{ByteMetadata, System};
 use sha1::{Digest, Sha1};
 use std::{
-    collections::VecDeque,
+    collections::{HashMap, HashSet, VecDeque},
     fs,
-    path::PathBuf,
+    path::{Path, PathBuf},
     sync::{Arc, Mutex},
     time::{Duration, Instant},
 };
@@ -25,11 +29,13 @@ use time::format_description::well_known::Rfc3339;
 use uuid::Uuid;
 use wgpu::util::DeviceExt;
 use winit::{
-    event::{ElementState, Event, WindowEvent},
-    event_loop::EventLoop,
+    event::{ElementState, Event, MouseScrollDelta, WindowEvent},
+    event_loop::EventLoopBuilder,
     keyboard::{KeyCode, PhysicalKey},
     window::WindowBuilder,
 };
+
+use crate::input::{Action, UserEvent};
 
 #[repr(C)]
 #[derive(Clone, Copy, Pod, Zeroable)]
@@ -126,6 +132,9 @@ impl AppConfig {
         let mut data_root = PathBuf::from("./data");
         let mut rom_root = PathBuf::from("./roms");
         let mut cores_root = PathBuf::from("./cores");
+        let mut data_root_overridden = false;
+        let mut rom_root_overridden = false;
+        let mut cores_root_overridden = false;
         let mut vsync = true;
         let mut args = std::env::args().skip(1);
 
@@ -138,18 +147,45 @@ impl AppConfig {
                     rom_path = args.next().map(PathBuf::from);
                 }
                 "--data" => {
-                    data_root = args.next().map(PathBuf::from).unwrap_or(data_root);
+                    if let Some(path) = args.next() {
+                        data_root = PathBuf::from(path);
+                        data_root_overridden = true;
+                    }
                 }
                 "--roms" => {
-                    rom_root = args.next().map(PathBuf::from).unwrap_or(rom_root);
+                    if let Some(path) = args.next() {
+                        rom_root = PathBuf::from(path);
+                        rom_root_overridden = true;
+                    }
                 }
                 "--cores" => {
-                    cores_root = args.next().map(PathBuf::from).unwrap_or(cores_root);
+                    if let Some(path) = args.next() {
+                        cores_root = PathBuf::from(path);
+                        cores_root_overridden = true;
+                    }
                 }
                 "--no-vsync" => {
                     vsync = false;
                 }
                 _ => {}
+            }
+        }
+
+        if !data_root_overridden || !rom_root_overridden || !cores_root_overridden {
+            if let Some(asset_root) = resolve_assets_root() {
+                if !data_root_overridden {
+                    data_root = asset_root.join("data");
+                }
+                if !rom_root_overridden {
+                    rom_root = asset_root.join("roms");
+                }
+                if !cores_root_overridden {
+                    cores_root = asset_root.join("cores");
+                }
+            } else if !data_root_overridden {
+                if let Some(default_root) = default_data_root() {
+                    data_root = default_root;
+                }
             }
         }
 
@@ -160,6 +196,72 @@ impl AppConfig {
             rom_root,
             cores_root,
             vsync,
+        }
+    }
+}
+
+fn resolve_assets_root() -> Option<PathBuf> {
+    let mut candidates = Vec::new();
+    if let Ok(cwd) = std::env::current_dir() {
+        candidates.push(cwd);
+    }
+    if let Ok(exe) = std::env::current_exe() {
+        if let Some(dir) = exe.parent() {
+            candidates.push(dir.to_path_buf());
+        }
+    }
+
+    let mut expanded = candidates.clone();
+    for candidate in &candidates {
+        if let Some(root) = find_repo_root(candidate) {
+            if !expanded.iter().any(|existing| existing == &root) {
+                expanded.push(root);
+            }
+        }
+    }
+
+    for candidate in expanded {
+        if has_asset_dirs(&candidate) {
+            return Some(candidate);
+        }
+    }
+    None
+}
+
+fn find_repo_root(start: &PathBuf) -> Option<PathBuf> {
+    let mut current = start.clone();
+    loop {
+        if current.join(".git").exists() || current.join("Cargo.toml").exists() {
+            return Some(current);
+        }
+        if !current.pop() {
+            break;
+        }
+    }
+    None
+}
+
+fn has_asset_dirs(root: &PathBuf) -> bool {
+    root.join("data").exists() || root.join("roms").exists() || root.join("cores").exists()
+}
+
+fn default_data_root() -> Option<PathBuf> {
+    if cfg!(target_os = "macos") {
+        let home = std::env::var_os("HOME")?;
+        let mut root = PathBuf::from(home);
+        root.push("Library");
+        root.push("Application Support");
+        root.push("Playbyte");
+        Some(root)
+    } else if cfg!(target_os = "windows") {
+        std::env::var_os("APPDATA").map(|appdata| PathBuf::from(appdata).join("Playbyte"))
+    } else {
+        if let Some(xdg) = std::env::var_os("XDG_DATA_HOME") {
+            Some(PathBuf::from(xdg).join("playbyte"))
+        } else if let Some(home) = std::env::var_os("HOME") {
+            Some(PathBuf::from(home).join(".local").join("share").join("playbyte"))
+        } else {
+            None
         }
     }
 }
@@ -209,11 +311,50 @@ struct RuntimeLoad {
     meta: RuntimeMetadata,
 }
 
+#[derive(Clone)]
+enum FeedItem {
+    Byte(ByteMetadata),
+    RomFallback(RomFallback),
+}
+
+#[derive(Clone)]
+struct RomFallback {
+    rom_sha1: String,
+    rom_path: PathBuf,
+    system: System,
+    title: String,
+    core_id: String,
+    core_path: Option<PathBuf>,
+}
+
+impl FeedItem {
+    fn system(&self) -> System {
+        match self {
+            FeedItem::Byte(byte) => byte.system.clone(),
+            FeedItem::RomFallback(fallback) => fallback.system.clone(),
+        }
+    }
+
+    fn title(&self) -> &str {
+        match self {
+            FeedItem::Byte(byte) => {
+                if byte.title.is_empty() {
+                    &byte.byte_id
+                } else {
+                    &byte.title
+                }
+            }
+            FeedItem::RomFallback(fallback) => &fallback.title,
+        }
+    }
+
+}
+
 struct FeedController {
     store: LocalByteStore,
     roms: RomLibrary,
     core_locator: CoreLocator,
-    bytes: Vec<ByteMetadata>,
+    items: Vec<FeedItem>,
     current_index: usize,
 }
 
@@ -227,41 +368,50 @@ impl FeedController {
         let _ = roms.scan()?;
 
         let core_locator = CoreLocator::new(config.cores_root.clone());
+        let items = build_feed_items(&core_locator, &roms, &bytes)?;
 
         Ok(Self {
             store,
             roms,
             core_locator,
-            bytes,
+            items,
             current_index: 0,
         })
     }
 
     fn is_empty(&self) -> bool {
-        self.bytes.is_empty()
+        self.items.is_empty()
     }
 
-    fn current(&self) -> Option<&ByteMetadata> {
-        self.bytes.get(self.current_index)
+    fn items(&self) -> &[FeedItem] {
+        &self.items
     }
 
-    fn select(&mut self, index: usize) -> Option<&ByteMetadata> {
-        if index < self.bytes.len() {
+    fn item_count(&self) -> usize {
+        self.items.len()
+    }
+
+    fn current(&self) -> Option<&FeedItem> {
+        self.items.get(self.current_index)
+    }
+
+    fn select(&mut self, index: usize) -> Option<&FeedItem> {
+        if index < self.items.len() {
             self.current_index = index;
         }
         self.current()
     }
 
-    fn next(&mut self) -> Option<&ByteMetadata> {
-        if self.bytes.is_empty() {
+    fn next(&mut self) -> Option<&FeedItem> {
+        if self.items.is_empty() {
             return None;
         }
-        self.current_index = (self.current_index + 1).min(self.bytes.len() - 1);
+        self.current_index = (self.current_index + 1).min(self.items.len() - 1);
         self.current()
     }
 
-    fn prev(&mut self) -> Option<&ByteMetadata> {
-        if self.bytes.is_empty() {
+    fn prev(&mut self) -> Option<&FeedItem> {
+        if self.items.is_empty() {
             return None;
         }
         if self.current_index > 0 {
@@ -271,62 +421,253 @@ impl FeedController {
     }
 
     fn prefetch_neighbors(&self) {
-        if self.bytes.is_empty() {
+        if self.items.is_empty() {
             return;
         }
         let mut ids = Vec::new();
-        if let Some(current) = self.current() {
+        if let Some(FeedItem::Byte(current)) = self.current() {
             ids.push(current.byte_id.clone());
         }
         if self.current_index > 0 {
-            ids.push(self.bytes[self.current_index - 1].byte_id.clone());
+            if let FeedItem::Byte(byte) = &self.items[self.current_index - 1] {
+                ids.push(byte.byte_id.clone());
+            }
         }
-        if self.current_index + 1 < self.bytes.len() {
-            ids.push(self.bytes[self.current_index + 1].byte_id.clone());
+        if self.current_index + 1 < self.items.len() {
+            if let FeedItem::Byte(byte) = &self.items[self.current_index + 1] {
+                ids.push(byte.byte_id.clone());
+            }
         }
         self.store.prefetch(&ids);
     }
 
     fn build_runtime_for_current(&self) -> Result<RuntimeLoad> {
-        let byte = self
-            .current()
-            .context("no selected Byte available in feed")?;
-        let core_path = self
-            .core_locator
-            .resolve(&byte.core_id)
-            .with_context(|| format!("missing core for {}", byte.core_id))?;
-        let rom_path = self
-            .roms
-            .find_by_hash(&byte.rom_sha1)
-            .with_context(|| format!("missing ROM for hash {}", byte.rom_sha1))?;
+        let item = self.current().context("no selected item available in feed")?;
+        match item {
+            FeedItem::Byte(byte) => {
+                let core_path = self
+                    .core_locator
+                    .resolve(&byte.core_id)
+                    .with_context(|| format!("missing core for {}", byte.core_id))?;
+                let rom_path = self
+                    .roms
+                    .find_by_hash(&byte.rom_sha1)
+                    .with_context(|| format!("missing ROM for hash {}", byte.rom_sha1))?;
 
-        let runtime = EmulatorRuntime::new(core_path, rom_path.clone())?;
-        let info = runtime.system_info();
-        if info.library_name != byte.core_id {
-            bail!(
-                "core mismatch: expected {}, found {}",
-                byte.core_id,
-                info.library_name
-            );
+                let runtime = EmulatorRuntime::new(core_path, rom_path.clone())?;
+                let info = runtime.system_info();
+                if info.library_name != byte.core_id {
+                    bail!(
+                        "core mismatch: expected {}, found {}",
+                        byte.core_id,
+                        info.library_name
+                    );
+                }
+                if info.library_version != byte.core_semver {
+                    bail!(
+                        "core version mismatch: expected {}, found {}",
+                        byte.core_semver,
+                        info.library_version
+                    );
+                }
+                let state = self.store.load_state(&byte.byte_id)?;
+                runtime.unserialize(&state)?;
+                let meta = RuntimeMetadata {
+                    core_id: byte.core_id.clone(),
+                    core_version: byte.core_semver.clone(),
+                    rom_sha1: byte.rom_sha1.clone(),
+                    _rom_path: rom_path,
+                    system: byte.system.clone(),
+                };
+                Ok(RuntimeLoad { runtime, meta })
+            }
+            FeedItem::RomFallback(fallback) => {
+                let core_path = if let Some(path) = &fallback.core_path {
+                    path.clone()
+                } else {
+                    self.core_locator
+                        .resolve(&fallback.core_id)
+                        .with_context(|| format!("missing core for {}", fallback.core_id))?
+                };
+                let runtime = EmulatorRuntime::new(core_path, fallback.rom_path.clone())?;
+                let meta = build_runtime_meta_from_runtime(&runtime, &fallback.rom_path)?;
+                Ok(RuntimeLoad { runtime, meta })
+            }
         }
-        if info.library_version != byte.core_semver {
-            bail!(
-                "core version mismatch: expected {}, found {}",
-                byte.core_semver,
-                info.library_version
-            );
-        }
-        let state = self.store.load_state(&byte.byte_id)?;
-        runtime.unserialize(&state)?;
-        let meta = RuntimeMetadata {
-            core_id: byte.core_id.clone(),
-            core_version: byte.core_semver.clone(),
-            rom_sha1: byte.rom_sha1.clone(),
-            _rom_path: rom_path,
-            system: byte.system.clone(),
-        };
-        Ok(RuntimeLoad { runtime, meta })
     }
+
+    fn add_byte(&mut self, metadata: ByteMetadata) {
+        let rom_sha1 = metadata.rom_sha1.clone();
+        self.items.retain(|item| {
+            !matches!(item, FeedItem::RomFallback(fallback) if fallback.rom_sha1 == rom_sha1)
+        });
+        self.items.push(FeedItem::Byte(metadata));
+        self.current_index = self.items.len().saturating_sub(1);
+    }
+
+    fn add_fallback_rom(
+        &mut self,
+        rom_path: PathBuf,
+        core_path: Option<PathBuf>,
+    ) -> Result<()> {
+        let rom_sha1 = hash_rom(&rom_path)?;
+        if self.items.iter().any(|item| match item {
+            FeedItem::Byte(byte) => byte.rom_sha1 == rom_sha1,
+            FeedItem::RomFallback(fallback) => fallback.rom_sha1 == rom_sha1,
+        }) {
+            return Ok(());
+        }
+        let system = system_from_rom_path(&rom_path);
+        let core_id = if let Some(path) = &core_path {
+            core_id_from_path(path)
+                .ok_or_else(|| anyhow::anyhow!("unable to infer core id from path"))?
+        } else {
+            let available_cores = list_core_ids(&self.core_locator.root);
+            let bytes: Vec<ByteMetadata> = self
+                .items
+                .iter()
+                .filter_map(|item| match item {
+                    FeedItem::Byte(byte) => Some(byte.clone()),
+                    FeedItem::RomFallback(_) => None,
+                })
+                .collect();
+            select_default_core(system.clone(), &available_cores, &bytes, &self.core_locator)
+                .ok_or_else(|| anyhow::anyhow!("no core available for fallback ROM"))?
+        };
+        let title = title_from_rom_path(&rom_path);
+        self.items.push(FeedItem::RomFallback(RomFallback {
+            rom_sha1,
+            rom_path,
+            system,
+            title,
+            core_id,
+            core_path,
+        }));
+        if self.items.len() == 1 {
+            self.current_index = 0;
+        }
+        Ok(())
+    }
+}
+
+fn build_feed_items(
+    core_locator: &CoreLocator,
+    roms: &RomLibrary,
+    bytes: &[ByteMetadata],
+) -> Result<Vec<FeedItem>> {
+    let mut items: Vec<FeedItem> = bytes.iter().cloned().map(FeedItem::Byte).collect();
+    let mut covered_roms: HashSet<String> = bytes.iter().map(|byte| byte.rom_sha1.clone()).collect();
+
+    let available_cores = list_core_ids(&core_locator.root);
+    let nes_core = select_default_core(System::Nes, &available_cores, bytes, core_locator);
+    let snes_core = select_default_core(System::Snes, &available_cores, bytes, core_locator);
+
+    let mut rom_entries = roms.entries();
+    rom_entries.sort_by(|a, b| a.1.to_string_lossy().cmp(&b.1.to_string_lossy()));
+    for (rom_sha1, rom_path) in rom_entries {
+        if covered_roms.contains(&rom_sha1) {
+            continue;
+        }
+        let system = system_from_rom_path(&rom_path);
+        let core_id = match system {
+            System::Nes => nes_core.clone(),
+            System::Snes => snes_core.clone(),
+        };
+        let Some(core_id) = core_id else {
+            continue;
+        };
+        let title = title_from_rom_path(&rom_path);
+        let core_path = core_locator.resolve(&core_id);
+        items.push(FeedItem::RomFallback(RomFallback {
+            rom_sha1: rom_sha1.clone(),
+            rom_path,
+            system,
+            title,
+            core_id,
+            core_path,
+        }));
+        covered_roms.insert(rom_sha1);
+    }
+
+    Ok(items)
+}
+
+fn title_from_rom_path(path: &Path) -> String {
+    path.file_stem()
+        .and_then(|stem| stem.to_str())
+        .map(|stem| stem.replace('_', " "))
+        .unwrap_or_else(|| "Unknown ROM".to_string())
+}
+
+fn core_id_from_path(path: &PathBuf) -> Option<String> {
+    let filename = path.file_name()?.to_str()?;
+    if let Some((core_id, _)) = filename.split_once("_libretro.") {
+        if !core_id.is_empty() {
+            return Some(core_id.to_string());
+        }
+    }
+    path.file_stem().and_then(|stem| stem.to_str()).map(|stem| stem.to_string())
+}
+
+fn list_core_ids(root: &PathBuf) -> Vec<String> {
+    let mut cores = Vec::new();
+    let Ok(entries) = fs::read_dir(root) else {
+        return cores;
+    };
+    for entry in entries.flatten() {
+        if let Ok(file_type) = entry.file_type() {
+            if !file_type.is_file() {
+                continue;
+            }
+        }
+        let Some(name) = entry.file_name().to_str().map(|value| value.to_string()) else {
+            continue;
+        };
+        if let Some((core_id, _)) = name.split_once("_libretro.") {
+            if !core_id.is_empty() {
+                cores.push(core_id.to_string());
+            }
+        }
+    }
+    cores.sort();
+    cores.dedup();
+    cores
+}
+
+fn select_default_core(
+    system: System,
+    available_cores: &[String],
+    bytes: &[ByteMetadata],
+    core_locator: &CoreLocator,
+) -> Option<String> {
+    let mut counts: HashMap<String, usize> = HashMap::new();
+    for byte in bytes {
+        if byte.system != system {
+            continue;
+        }
+        if core_locator.resolve(&byte.core_id).is_none() {
+            continue;
+        }
+        *counts.entry(byte.core_id.clone()).or_insert(0) += 1;
+    }
+    if let Some((core_id, _)) = counts.into_iter().max_by_key(|(_, count)| *count) {
+        return Some(core_id);
+    }
+
+    let preferred = match system {
+        System::Nes => &["mesen", "nestopia", "fceux", "nes"][..],
+        System::Snes => &["bsnes", "snes9x", "snes"][..],
+    };
+    for needle in preferred {
+        if let Some(core_id) = available_cores
+            .iter()
+            .find(|core| core.to_lowercase().contains(needle))
+        {
+            return Some(core_id.clone());
+        }
+    }
+
+    available_cores.first().cloned()
 }
 
 struct VideoTexture {
@@ -365,7 +706,7 @@ impl GuiState {
         }
     }
 
-    fn handle_event(&mut self, window: &winit::window::Window, event: &Event<()>) {
+    fn handle_event(&mut self, window: &winit::window::Window, event: &Event<UserEvent>) {
         if let Event::WindowEvent { event, .. } = event {
             let _ = self.winit.on_window_event(window, event);
         }
@@ -375,7 +716,7 @@ impl GuiState {
 struct GuiOutput {
     paint_jobs: Vec<egui::ClippedPrimitive>,
     screen_desc: ScreenDescriptor,
-    selected_index: Option<usize>,
+    actions: Vec<Action>,
 }
 
 struct State {
@@ -396,12 +737,14 @@ struct State {
     audio_stream: Option<cpal::Stream>,
     feed: Option<FeedController>,
     feed_error: Option<String>,
-    status_message: Option<String>,
     gui: GuiState,
+    ui: ui::UiState,
     last_update: Instant,
     accumulator: f64,
     frame_stats: FrameStats,
     data_root: PathBuf,
+    scroll_accumulator: f32,
+    last_scroll_nav: Instant,
 }
 
 impl State {
@@ -557,12 +900,27 @@ fn fs_main(in: VertexOut) -> @location(0) vec4<f32> {
             usage: wgpu::BufferUsages::INDEX,
         });
 
-        let mut feed = None;
-        let mut feed_error = None;
-        let mut runtime_load: Option<RuntimeLoad> = None;
+    let mut feed = None;
+    let mut feed_error = None;
+    let mut runtime_load: Option<RuntimeLoad> = None;
 
-        if let (Some(core), Some(rom)) = (app_config.core_path.clone(), app_config.rom_path.clone())
-        {
+    match FeedController::load(&app_config) {
+        Ok(controller) => {
+            if controller.is_empty() {
+                feed_error = Some("No Bytes or ROMs found to build the feed.".to_string());
+            }
+            feed = Some(controller);
+        }
+        Err(err) => feed_error = Some(format!("Feed error: {err}")),
+    }
+
+    if let (Some(core), Some(rom)) = (app_config.core_path.clone(), app_config.rom_path.clone())
+    {
+        if let Some(controller) = feed.as_mut() {
+            if let Err(err) = controller.add_fallback_rom(rom, Some(core)) {
+                feed_error = Some(format!("Feed ROM error: {err}"));
+            }
+        } else {
             match EmulatorRuntime::new(core, rom.clone()) {
                 Ok(rt) => match build_runtime_meta_from_runtime(&rt, &rom) {
                     Ok(meta) => runtime_load = Some(RuntimeLoad { runtime: rt, meta }),
@@ -570,23 +928,15 @@ fn fs_main(in: VertexOut) -> @location(0) vec4<f32> {
                 },
                 Err(err) => feed_error = Some(format!("Runtime error: {err}")),
             }
-        } else {
-            match FeedController::load(&app_config) {
-                Ok(controller) => {
-                    if controller.is_empty() {
-                        feed_error = Some("No Bytes found in data/bytes".to_string());
-                    } else {
-                        feed = Some(controller);
-                    }
-                }
-                Err(err) => feed_error = Some(format!("Feed error: {err}")),
-            }
         }
+    }
 
         if let Some(controller) = &feed {
-            match controller.build_runtime_for_current() {
-                Ok(load) => runtime_load = Some(load),
-                Err(err) => feed_error = Some(format!("Load Byte failed: {err}")),
+            if !controller.is_empty() {
+                match controller.build_runtime_for_current() {
+                    Ok(load) => runtime_load = Some(load),
+                    Err(err) => feed_error = Some(format!("Load feed item failed: {err}")),
+                }
             }
         }
 
@@ -604,6 +954,7 @@ fn fs_main(in: VertexOut) -> @location(0) vec4<f32> {
             .and_then(|rt| build_audio_stream(rt.audio_buffer()).ok());
 
         let gui = GuiState::new(window, &device, surface_config.format);
+        let ui = ui::UiState::new(&gui.ctx);
 
         Ok(Self {
             surface,
@@ -623,12 +974,14 @@ fn fs_main(in: VertexOut) -> @location(0) vec4<f32> {
             audio_stream,
             feed,
             feed_error,
-            status_message: None,
             gui,
+            ui,
             last_update: Instant::now(),
             accumulator: 0.0,
             frame_stats: FrameStats::new(120),
             data_root: app_config.data_root,
+            scroll_accumulator: 0.0,
+            last_scroll_nav: Instant::now(),
         })
     }
 
@@ -753,8 +1106,8 @@ fn fs_main(in: VertexOut) -> @location(0) vec4<f32> {
         }
         for event in events {
             if let EventType::ButtonPressed(button, _) = event.event {
-                if let Some(delta) = feed_nav_button(button) {
-                    self.navigate_feed(delta);
+                if let Some(action) = input::action_from_button(button, true) {
+                    self.apply_action(action);
                     continue;
                 }
             }
@@ -775,10 +1128,11 @@ fn fs_main(in: VertexOut) -> @location(0) vec4<f32> {
     }
 
     fn handle_keyboard(&mut self, key: KeyCode, pressed: bool) {
-        if let Some(delta) = feed_nav_key(key) {
-            if pressed {
-                self.navigate_feed(delta);
-            }
+        if self.gui.ctx.wants_keyboard_input() {
+            return;
+        }
+        if let Some(action) = input::action_from_key(key, pressed) {
+            self.apply_action(action);
             return;
         }
 
@@ -793,63 +1147,139 @@ fn fs_main(in: VertexOut) -> @location(0) vec4<f32> {
         }
     }
 
+    fn handle_scroll(&mut self, delta: &MouseScrollDelta) {
+        if self.gui.ctx.wants_keyboard_input() {
+            return;
+        }
+        let (x, y) = match delta {
+            MouseScrollDelta::LineDelta(x, y) => (*x * 40.0, *y * 40.0),
+            MouseScrollDelta::PixelDelta(pos) => (pos.x as f32, pos.y as f32),
+        };
+        let amount = if x.abs() > y.abs() { x } else { y };
+        if amount.abs() < 1.0 {
+            return;
+        }
+        let capped = amount.clamp(-240.0, 240.0);
+        self.scroll_accumulator += capped;
+        let step = 70.0;
+        if self.scroll_accumulator.abs() < step {
+            return;
+        }
+        let now = Instant::now();
+        if now.saturating_duration_since(self.last_scroll_nav) < Duration::from_millis(140) {
+            return;
+        }
+        let action = if self.scroll_accumulator > 0.0 {
+            Action::PrevItem
+        } else {
+            Action::NextItem
+        };
+        self.scroll_accumulator = 0.0;
+        self.last_scroll_nav = now;
+        self.apply_action(action);
+    }
+
+    fn apply_action(&mut self, action: Action) {
+        self.ui.record_interaction();
+        match action {
+            Action::NextItem => self.navigate_feed_filtered(1),
+            Action::PrevItem => self.navigate_feed_filtered(-1),
+            Action::SelectIndex(index) => self.select_feed_index(index),
+            Action::CreateByte => self.create_byte(),
+            Action::ToggleOverlay => self.ui.toggle_overlay(),
+        }
+    }
+
+    fn navigate_feed_filtered(&mut self, delta: i32) {
+        let Some(feed) = self.feed.as_ref() else {
+            return;
+        };
+        if delta == 0 {
+            return;
+        }
+        if self.ui.is_filtering() {
+            let indices = self.ui.filtered_indices(feed);
+            if indices.is_empty() {
+                return;
+            }
+            let current = feed.current_index;
+            let position = indices.iter().position(|&idx| idx == current).unwrap_or(0);
+            let next_pos = if delta > 0 {
+                (position + 1).min(indices.len().saturating_sub(1))
+            } else {
+                position.saturating_sub(1)
+            };
+            self.select_feed_index(indices[next_pos]);
+            return;
+        }
+        self.navigate_feed(delta);
+    }
+
     fn navigate_feed(&mut self, delta: i32) {
-        let load_result = {
+        let has_selection = {
             let Some(feed) = self.feed.as_mut() else {
                 return;
             };
 
-            let has_selection = if delta > 0 {
+            if delta > 0 {
                 feed.next().is_some()
             } else if delta < 0 {
                 feed.prev().is_some()
             } else {
                 feed.current().is_some()
-            };
-
-            if has_selection {
-                Some(feed.build_runtime_for_current())
-            } else {
-                None
             }
         };
 
-        if let Some(result) = load_result {
-            match result {
-                Ok(load) => {
-                    self.apply_runtime_load(load);
-                    self.feed_error = None;
-                    if let Some(feed) = self.feed.as_ref() {
-                        feed.prefetch_neighbors();
-                    }
+        if !has_selection {
+            return;
+        }
+
+        self.unload_runtime();
+        let result = self
+            .feed
+            .as_ref()
+            .and_then(|feed| feed.build_runtime_for_current().ok());
+        match result {
+            Some(load) => {
+                self.apply_runtime_load(load);
+                self.feed_error = None;
+                if let Some(feed) = self.feed.as_ref() {
+                    feed.prefetch_neighbors();
                 }
-                Err(err) => self.feed_error = Some(format!("Load Byte failed: {err}")),
+            }
+            None => {
+                self.feed_error = Some("Load feed item failed.".to_string());
             }
         }
     }
 
     fn select_feed_index(&mut self, index: usize) {
-        let load_result = {
+        let has_selection = {
             let Some(feed) = self.feed.as_mut() else {
                 return;
             };
-            if feed.select(index).is_some() {
-                Some(feed.build_runtime_for_current())
-            } else {
-                None
-            }
+            feed.select(index).is_some()
         };
 
-        if let Some(result) = load_result {
-            match result {
-                Ok(load) => {
-                    self.apply_runtime_load(load);
-                    self.feed_error = None;
-                    if let Some(feed) = self.feed.as_ref() {
-                        feed.prefetch_neighbors();
-                    }
+        if !has_selection {
+            return;
+        }
+
+        self.unload_runtime();
+        let result = self
+            .feed
+            .as_ref()
+            .and_then(|feed| feed.build_runtime_for_current().ok());
+        match result {
+            Some(load) => {
+                self.apply_runtime_load(load);
+                self.feed_error = None;
+                if let Some(feed) = self.feed.as_ref() {
+                    feed.prefetch_neighbors();
                 }
-                Err(err) => self.feed_error = Some(format!("Load Byte failed: {err}")),
+            }
+            None => {
+                self.feed_error = Some("Load feed item failed.".to_string());
             }
         }
     }
@@ -859,7 +1289,14 @@ fn fs_main(in: VertexOut) -> @location(0) vec4<f32> {
         self.runtime_meta = Some(load.meta);
         self.runtime = Some(load.runtime);
         self.accumulator = 0.0;
-        self.status_message = None;
+        self.ui.trigger_transition();
+    }
+
+    fn unload_runtime(&mut self) {
+        self.audio_stream = None;
+        self.runtime_meta = None;
+        self.runtime = None;
+        self.accumulator = 0.0;
     }
 
     fn create_byte(&mut self) {
@@ -867,6 +1304,10 @@ fn fs_main(in: VertexOut) -> @location(0) vec4<f32> {
             Some(runtime) => runtime,
             None => {
                 self.feed_error = Some("No active runtime to capture".to_string());
+                self.ui.push_toast(
+                    ui::ToastKind::Error,
+                    "No active runtime to capture".to_string(),
+                );
                 return;
             }
         };
@@ -874,6 +1315,10 @@ fn fs_main(in: VertexOut) -> @location(0) vec4<f32> {
             Some(meta) => meta.clone(),
             None => {
                 self.feed_error = Some("Missing runtime metadata".to_string());
+                self.ui.push_toast(
+                    ui::ToastKind::Error,
+                    "Missing runtime metadata".to_string(),
+                );
                 return;
             }
         };
@@ -881,6 +1326,10 @@ fn fs_main(in: VertexOut) -> @location(0) vec4<f32> {
             Some(frame) => frame,
             None => {
                 self.feed_error = Some("No frame available for thumbnail".to_string());
+                self.ui.push_toast(
+                    ui::ToastKind::Error,
+                    "No frame available for thumbnail".to_string(),
+                );
                 return;
             }
         };
@@ -888,6 +1337,10 @@ fn fs_main(in: VertexOut) -> @location(0) vec4<f32> {
             Ok(state) => state,
             Err(err) => {
                 self.feed_error = Some(format!("Serialize failed: {err}"));
+                self.ui.push_toast(
+                    ui::ToastKind::Error,
+                    format!("Serialize failed: {err}"),
+                );
                 return;
             }
         };
@@ -895,6 +1348,10 @@ fn fs_main(in: VertexOut) -> @location(0) vec4<f32> {
             Ok(png) => png,
             Err(err) => {
                 self.feed_error = Some(format!("Thumbnail failed: {err}"));
+                self.ui.push_toast(
+                    ui::ToastKind::Error,
+                    format!("Thumbnail failed: {err}"),
+                );
                 return;
             }
         };
@@ -927,15 +1384,20 @@ fn fs_main(in: VertexOut) -> @location(0) vec4<f32> {
 
         if let Err(err) = store.save_byte(&metadata, &state, &thumbnail) {
             self.feed_error = Some(format!("Save Byte failed: {err}"));
+            self.ui
+                .push_toast(ui::ToastKind::Error, format!("Save Byte failed: {err}"));
             return;
         }
 
         if let Some(feed) = self.feed.as_mut() {
-            feed.bytes.push(metadata.clone());
-            feed.current_index = feed.bytes.len().saturating_sub(1);
+            feed.add_byte(metadata.clone());
         }
 
-        self.status_message = Some(format!("Saved Byte {}", metadata.byte_id));
+        self.feed_error = None;
+        self.ui.push_toast(
+            ui::ToastKind::Success,
+            format!("Saved Byte {}", metadata.byte_id),
+        );
     }
 
     fn update_video_texture(&mut self, frame: &playbyte_libretro::VideoFrame) {
@@ -1053,62 +1515,15 @@ fn fs_main(in: VertexOut) -> @location(0) vec4<f32> {
     fn prepare_gui(&mut self, window: &winit::window::Window) -> GuiOutput {
         let raw_input = self.gui.winit.take_egui_input(window);
         self.gui.ctx.begin_frame(raw_input);
-
-        let mut selected_index = None;
-        let mut create_byte = false;
-
-        egui::TopBottomPanel::top("top_bar").show(&self.gui.ctx, |ui| {
-            ui.horizontal(|ui| {
-                ui.heading("Playbyte");
-                if self.runtime.is_some() {
-                    if ui.button("Bookmark Byte").clicked() {
-                        create_byte = true;
-                    }
-                }
-                if let Some(fps) = self.frame_stats.avg_fps() {
-                    ui.label(format!("{fps:.0} fps"));
-                }
-                if let Some(runtime) = &self.runtime {
-                    ui.label(format!("emu {:.1} Hz", runtime.fps()));
-                }
-                if let Some(feed) = &self.feed {
-                    ui.label(format!("{} bytes", feed.bytes.len()));
-                }
-            });
-        });
-
-        egui::CentralPanel::default().show(&self.gui.ctx, |ui| {
-            if let Some(feed) = &self.feed {
-                for (idx, byte) in feed.bytes.iter().enumerate() {
-                    let title = if byte.title.is_empty() {
-                        &byte.byte_id
-                    } else {
-                        &byte.title
-                    };
-                    if ui
-                        .selectable_label(idx == feed.current_index, title)
-                        .clicked()
-                    {
-                        selected_index = Some(idx);
-                    }
-                }
-            } else {
-                ui.label("No feed loaded. Pass --core and --rom or add Bytes in ./data/bytes.");
-            }
-
-            if let Some(error) = &self.feed_error {
-                ui.add_space(12.0);
-                ui.colored_label(egui::Color32::LIGHT_RED, error);
-            }
-            if let Some(status) = &self.status_message {
-                ui.add_space(6.0);
-                ui.colored_label(egui::Color32::LIGHT_GREEN, status);
-            }
-        });
-
-        if create_byte {
-            self.create_byte();
-        }
+        let ui_output = self.ui.render(
+            &self.gui.ctx,
+            ui::UiContext {
+                feed: self.feed.as_ref(),
+                runtime: self.runtime.as_ref(),
+                frame_stats: &self.frame_stats,
+                feed_error: self.feed_error.as_deref(),
+            },
+        );
 
         let output = self.gui.ctx.end_frame();
         self.gui
@@ -1137,14 +1552,16 @@ fn fs_main(in: VertexOut) -> @location(0) vec4<f32> {
         GuiOutput {
             paint_jobs,
             screen_desc,
-            selected_index,
+            actions: ui_output.actions,
         }
     }
 
     fn render(&mut self, window: &winit::window::Window) -> Result<(), wgpu::SurfaceError> {
         let gui_output = self.prepare_gui(window);
-        if let Some(index) = gui_output.selected_index {
-            self.select_feed_index(index);
+        if !gui_output.actions.is_empty() {
+            for action in gui_output.actions {
+                self.apply_action(action);
+            }
         }
 
         let frame = self.surface.get_current_texture()?;
@@ -1215,14 +1632,6 @@ fn map_gilrs_button(button: Button) -> Option<u32> {
     }
 }
 
-fn feed_nav_button(button: Button) -> Option<i32> {
-    match button {
-        Button::LeftTrigger2 => Some(-1),
-        Button::RightTrigger2 => Some(1),
-        _ => None,
-    }
-}
-
 fn map_keycode(key: KeyCode) -> Option<u32> {
     match key {
         KeyCode::KeyZ => Some(RETRO_DEVICE_ID_JOYPAD_B),
@@ -1233,14 +1642,6 @@ fn map_keycode(key: KeyCode) -> Option<u32> {
         KeyCode::ArrowDown => Some(RETRO_DEVICE_ID_JOYPAD_DOWN),
         KeyCode::ArrowLeft => Some(RETRO_DEVICE_ID_JOYPAD_LEFT),
         KeyCode::ArrowRight => Some(RETRO_DEVICE_ID_JOYPAD_RIGHT),
-        _ => None,
-    }
-}
-
-fn feed_nav_key(key: KeyCode) -> Option<i32> {
-    match key {
-        KeyCode::PageUp => Some(-1),
-        KeyCode::PageDown => Some(1),
         _ => None,
     }
 }
@@ -1398,7 +1799,9 @@ where
 
 fn main() -> Result<()> {
     let app_config = AppConfig::from_env();
-    let event_loop = EventLoop::new()?;
+    let event_loop = EventLoopBuilder::<UserEvent>::with_user_event().build()?;
+    let proxy = event_loop.create_proxy();
+    let _dualsense_thread = dualsense::spawn_dualsense_listener(proxy);
     let window = WindowBuilder::new()
         .with_title("Playbyte")
         .build(&event_loop)?;
@@ -1407,6 +1810,10 @@ fn main() -> Result<()> {
     event_loop.run(move |event, elwt| {
         state.gui.handle_event(&window, &event);
         match event {
+            Event::UserEvent(UserEvent::Action(action)) => {
+                state.apply_action(action);
+                window.request_redraw();
+            }
             Event::WindowEvent { event, window_id } if window_id == window.id() => match event {
                 WindowEvent::CloseRequested => elwt.exit(),
                 WindowEvent::Resized(size) => state.resize(size),
@@ -1421,6 +1828,9 @@ fn main() -> Result<()> {
                         let pressed = event.state == ElementState::Pressed;
                         state.handle_keyboard(code, pressed);
                     }
+                }
+                WindowEvent::MouseWheel { delta, .. } => {
+                    state.handle_scroll(&delta);
                 }
                 _ => {}
             },

@@ -16,9 +16,9 @@ const RETRO_ENVIRONMENT_SET_PIXEL_FORMAT: u32 = 10;
 #[repr(u32)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RetroPixelFormat {
-    Xrgb8888 = 0,
-    Rgb565 = 1,
-    _0rgb1555 = 2,
+    _0rgb1555 = 0,
+    Xrgb8888 = 1,
+    Rgb565 = 2,
 }
 
 #[repr(C)]
@@ -176,7 +176,7 @@ impl Callbacks {
             audio_sample_batch,
             input_poll,
             input_state,
-            pixel_format: Mutex::new(RetroPixelFormat::Xrgb8888),
+            pixel_format: Mutex::new(RetroPixelFormat::_0rgb1555),
         }
     }
 
@@ -244,7 +244,7 @@ unsafe extern "C" fn environment_callback(cmd: u32, data: *mut c_void) -> bool {
             let format = *(data as *const RetroPixelFormat);
             let supported = matches!(
                 format,
-                RetroPixelFormat::Xrgb8888 | RetroPixelFormat::Rgb565
+                RetroPixelFormat::_0rgb1555 | RetroPixelFormat::Xrgb8888 | RetroPixelFormat::Rgb565
             );
             if supported {
                 let _ = with_callbacks(|callbacks| callbacks.set_pixel_format(format));
@@ -485,6 +485,18 @@ impl Drop for LibretroCore {
     fn drop(&mut self) {
         self.unload_game();
         unsafe { (self.symbols.retro_deinit)() };
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::RetroPixelFormat;
+
+    #[test]
+    fn retro_pixel_format_values_match_libretro() {
+        assert_eq!(RetroPixelFormat::_0rgb1555 as u32, 0);
+        assert_eq!(RetroPixelFormat::Xrgb8888 as u32, 1);
+        assert_eq!(RetroPixelFormat::Rgb565 as u32, 2);
     }
 }
 

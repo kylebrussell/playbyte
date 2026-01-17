@@ -6,3 +6,9 @@
 *.swp
 *.log
 *.tmp
+
+# Build artifacts and user data
+cores/
+data/
+dist/
+roms/
