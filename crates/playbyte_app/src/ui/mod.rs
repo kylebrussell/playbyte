@@ -12,6 +12,8 @@ use std::time::{Duration, Instant};
 use crate::input::Action;
 use thumbnails::ThumbnailCache;
 
+const OFFICIAL_PICKER_LIMIT: usize = 24;
+
 pub struct UiContext<'a> {
     pub feed: Option<&'a FeedController>,
     pub runtime: Option<&'a EmulatorRuntime>,
@@ -77,7 +79,11 @@ impl UiState {
             egui::Area::new(egui::Id::new("controls_hint"))
                 .anchor(egui::Align2::CENTER_BOTTOM, [0.0, -24.0])
                 .show(ctx, |ui| {
-                    hint_strip(ui, "Swipe trackpad or L2/R2 to browse • B to bookmark • Tab to hide", &self.theme);
+                    hint_strip(
+                        ui,
+                        "Swipe trackpad or L2/R2 to browse • Square/B to bookmark • Options/Tab to hide",
+                        &self.theme,
+                    );
                 });
         }
 
@@ -108,15 +114,78 @@ impl UiState {
         self.overlay_visible = !self.overlay_visible;
     }
 
+    pub fn is_overlay_visible(&self) -> bool {
+        self.overlay_visible
+    }
+
     pub fn is_editing_text(&self) -> bool {
         self.rename_target.is_some()
+    }
+
+    pub fn is_official_picker_open(&self) -> bool {
+        self.official_picker.is_some()
+    }
+
+    pub fn start_rename(&mut self, index: usize, title: String) {
+        self.rename_target = Some(index);
+        self.rename_draft = title;
+        self.record_interaction();
+    }
+
+    pub fn cancel_active_ui(&mut self) -> bool {
+        let mut changed = false;
+        if self.rename_target.is_some() {
+            self.rename_target = None;
+            changed = true;
+        }
+        if self.official_picker.is_some() {
+            self.official_picker = None;
+            changed = true;
+        }
+        if changed {
+            self.record_interaction();
+        }
+        changed
+    }
+
+    pub fn move_official_picker_selection(&mut self, delta: i32) {
+        let Some(state) = self.official_picker.as_mut() else {
+            return;
+        };
+        let results_len = state.search_results(OFFICIAL_PICKER_LIMIT).len();
+        if results_len == 0 {
+            return;
+        }
+        let mut next = state.selected_result as i32 + delta;
+        next = next.clamp(0, results_len.saturating_sub(1) as i32);
+        let next = next as usize;
+        if next != state.selected_result {
+            state.selected_result = next;
+            self.record_interaction();
+        }
+    }
+
+    pub fn confirm_official_picker_selection(&mut self) -> Option<(usize, String)> {
+        let (index, title) = {
+            let state = self.official_picker.as_ref()?;
+            let results = state.search_results(OFFICIAL_PICKER_LIMIT);
+            if results.is_empty() {
+                return None;
+            }
+            let selected = state.selected_result.min(results.len() - 1);
+            let title = state.titles[results[selected]].clone();
+            (state.index, title)
+        };
+        self.official_picker = None;
+        self.record_interaction();
+        Some((index, title))
     }
 
     pub fn invalidate_cover_art(&mut self, rom_sha1: &str) {
         self.covers.invalidate(rom_sha1);
     }
 
-    fn open_official_picker(
+    pub fn open_official_picker(
         &mut self,
         index: usize,
         fallback: &crate::RomFallback,
@@ -135,6 +204,7 @@ impl UiState {
             titles,
             normalized_titles,
             query: String::new(),
+            selected_result: 0,
         });
     }
 
@@ -443,18 +513,26 @@ impl UiState {
                 ui.label(format!("System: {system_label}"));
                 ui.add_space(6.0);
                 ui.label("Search official titles");
-                ui.text_edit_singleline(&mut state.query);
+                let response = ui.text_edit_singleline(&mut state.query);
+                if response.changed() {
+                    state.selected_result = 0;
+                }
                 ui.add_space(8.0);
                 if state.titles.is_empty() {
                     ui.label("No official database available.");
                 } else {
-                    let results = state.search_results(24);
+                    let results = state.search_results(OFFICIAL_PICKER_LIMIT);
                     egui::ScrollArea::vertical()
                         .max_height(260.0)
                         .show(ui, |ui| {
-                            for idx in results {
+                            if !results.is_empty() {
+                                state.selected_result =
+                                    state.selected_result.min(results.len().saturating_sub(1));
+                            }
+                            for (pos, idx) in results.iter().copied().enumerate() {
                                 let title = &state.titles[idx];
-                                if ui.selectable_label(false, title).clicked() {
+                                let selected = pos == state.selected_result;
+                                if ui.selectable_label(selected, title).clicked() {
                                     actions.push(Action::SetOfficialTitle {
                                         index: state.index,
                                         title: title.clone(),
@@ -553,6 +631,7 @@ struct OfficialPickerState {
     titles: Vec<String>,
     normalized_titles: Vec<String>,
     query: String,
+    selected_result: usize,
 }
 
 impl OfficialPickerState {

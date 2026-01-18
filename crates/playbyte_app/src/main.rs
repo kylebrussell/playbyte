@@ -6,7 +6,7 @@ use anyhow::{bail, Context, Result};
 use bytemuck::{Pod, Zeroable};
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use egui_wgpu::ScreenDescriptor;
-use gilrs::{Button, EventType, Gilrs};
+use gilrs::{Axis, Button, EventType, Gilrs};
 use image::codecs::png::PngEncoder;
 use image::{ColorType, ImageEncoder};
 use playbyte_emulation::{
@@ -14,6 +14,7 @@ use playbyte_emulation::{
     RETRO_DEVICE_ID_JOYPAD_B, RETRO_DEVICE_ID_JOYPAD_DOWN, RETRO_DEVICE_ID_JOYPAD_L,
     RETRO_DEVICE_ID_JOYPAD_LEFT, RETRO_DEVICE_ID_JOYPAD_R, RETRO_DEVICE_ID_JOYPAD_RIGHT,
     RETRO_DEVICE_ID_JOYPAD_SELECT, RETRO_DEVICE_ID_JOYPAD_START, RETRO_DEVICE_ID_JOYPAD_UP,
+    RETRO_DEVICE_ID_JOYPAD_X, RETRO_DEVICE_ID_JOYPAD_Y,
 };
 use playbyte_feed::{LocalByteStore, RomLibrary};
 use playbyte_types::{ByteMetadata, System};
@@ -22,7 +23,10 @@ use std::{
     collections::{HashMap, HashSet, VecDeque},
     fs,
     path::{Path, PathBuf},
-    sync::{Arc, Mutex},
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc, Mutex,
+    },
     time::{Duration, Instant},
 };
 use time::format_description::well_known::Rfc3339;
@@ -78,6 +82,57 @@ const VERTICES: &[Vertex] = &[
 
 const INDICES: &[u16] = &[0, 1, 2, 0, 2, 3];
 
+const SDL_GAMECONTROLLERCONFIG: &str = "SDL_GAMECONTROLLERCONFIG";
+const DUALSENSE_USB_MAPPING: &str = "050000004c050000e60c000000010000,PS5 Controller,a:b1,b:b2,back:b8,dpdown:h0.4,dpleft:h0.8,dpright:h0.2,dpup:h0.1,guide:b12,leftshoulder:b4,leftstick:b10,lefttrigger:a3,leftx:a0,lefty:a1,misc1:b14,rightshoulder:b5,rightstick:b11,righttrigger:a4,rightx:a2,righty:a5,start:b9,touchpad:b13,x:b0,y:b3,platform:Mac OS X,";
+const DUALSENSE_BLUETOOTH_MAPPING: &str = "050000004c050000f20d000000010000,PS5 Controller,a:b1,b:b2,back:b8,dpdown:h0.4,dpleft:h0.8,dpright:h0.2,dpup:h0.1,guide:b12,leftshoulder:b4,leftstick:b10,lefttrigger:a3,leftx:a0,lefty:a1,rightshoulder:b5,rightstick:b11,righttrigger:a4,rightx:a2,righty:a5,start:b9,touchpad:b13,x:b0,y:b3,platform:Mac OS X,";
+const GAMEPAD_AXIS_THRESHOLD: f32 = 0.5;
+
+fn configure_dualsense_mappings() {
+    if !cfg!(target_os = "macos") {
+        return;
+    }
+    let existing = std::env::var(SDL_GAMECONTROLLERCONFIG).unwrap_or_default();
+    let mut entries = Vec::new();
+    if !existing.contains("050000004c050000e60c000000010000") {
+        entries.push(DUALSENSE_USB_MAPPING);
+    }
+    if !existing.contains("050000004c050000f20d000000010000") {
+        entries.push(DUALSENSE_BLUETOOTH_MAPPING);
+    }
+    if entries.is_empty() {
+        return;
+    }
+    let mut updated = existing;
+    if !updated.is_empty() && !updated.ends_with('\n') {
+        updated.push('\n');
+    }
+    updated.push_str(&entries.join("\n"));
+    std::env::set_var(SDL_GAMECONTROLLERCONFIG, updated);
+}
+
+fn axis_to_dpad_buttons(axis: Axis, value: f32) -> Option<[(Button, bool); 2]> {
+    let direction = if value <= -GAMEPAD_AXIS_THRESHOLD {
+        -1
+    } else if value >= GAMEPAD_AXIS_THRESHOLD {
+        1
+    } else {
+        0
+    };
+    match axis {
+        Axis::DPadX => Some(match direction {
+            -1 => [(Button::DPadLeft, true), (Button::DPadRight, false)],
+            1 => [(Button::DPadLeft, false), (Button::DPadRight, true)],
+            _ => [(Button::DPadLeft, false), (Button::DPadRight, false)],
+        }),
+        Axis::DPadY => Some(match direction {
+            -1 => [(Button::DPadUp, true), (Button::DPadDown, false)],
+            1 => [(Button::DPadUp, false), (Button::DPadDown, true)],
+            _ => [(Button::DPadUp, false), (Button::DPadDown, false)],
+        }),
+        _ => None,
+    }
+}
+
 struct FrameStats {
     samples: VecDeque<f64>,
     max_samples: usize,
@@ -123,6 +178,7 @@ struct AppConfig {
     rom_root: PathBuf,
     cores_root: PathBuf,
     vsync: bool,
+    dualsense_swipes: bool,
 }
 
 impl AppConfig {
@@ -136,6 +192,7 @@ impl AppConfig {
         let mut rom_root_overridden = false;
         let mut cores_root_overridden = false;
         let mut vsync = true;
+        let mut dualsense_swipes = true;
         let mut args = std::env::args().skip(1);
 
         while let Some(arg) = args.next() {
@@ -167,6 +224,9 @@ impl AppConfig {
                 "--no-vsync" => {
                     vsync = false;
                 }
+                "--no-dualsense-swipes" => {
+                    dualsense_swipes = false;
+                }
                 _ => {}
             }
         }
@@ -196,6 +256,7 @@ impl AppConfig {
             rom_root,
             cores_root,
             vsync,
+            dualsense_swipes,
         }
     }
 }
@@ -835,6 +896,7 @@ struct State {
     feed_error: Option<String>,
     gui: GuiState,
     ui: ui::UiState,
+    dualsense_buttons_enabled: Arc<AtomicBool>,
     last_update: Instant,
     accumulator: f64,
     frame_stats: FrameStats,
@@ -842,7 +904,11 @@ struct State {
 }
 
 impl State {
-    async fn new(window: &winit::window::Window, app_config: AppConfig) -> Result<Self> {
+    async fn new(
+        window: &winit::window::Window,
+        app_config: AppConfig,
+        dualsense_buttons_enabled: Arc<AtomicBool>,
+    ) -> Result<Self> {
         let size = window.inner_size();
         let instance = wgpu::Instance::default();
         let surface_target = unsafe { wgpu::SurfaceTargetUnsafe::from_window(window)? };
@@ -1042,13 +1108,41 @@ fn fs_main(in: VertexOut) -> @location(0) vec4<f32> {
             Some(load) => (Some(load.runtime), Some(load.meta)),
             None => (None, None),
         };
-        let gilrs = Gilrs::new().ok();
+        configure_dualsense_mappings();
+        let (gilrs, gamepad_error) = match Gilrs::new() {
+            Ok(gilrs) => (Some(gilrs), None),
+            Err(err) => (None, Some(format!("Gamepad init failed: {err}"))),
+        };
         let audio_stream = runtime
             .as_ref()
             .and_then(|rt| build_audio_stream(rt.audio_buffer()).ok());
 
         let gui = GuiState::new(window, &device, surface_config.format);
-        let ui = ui::UiState::new(&gui.ctx);
+        let mut ui = ui::UiState::new(&gui.ctx);
+        if let Some(message) = gamepad_error {
+            ui.push_toast(ui::ToastKind::Error, message);
+        }
+        let detected_gamepads = gilrs
+            .as_ref()
+            .map(|gilrs| {
+                gilrs
+                    .gamepads()
+                    .map(|(_, gamepad)| {
+                        format!(
+                            "Gamepad detected: {} ({:?})",
+                            gamepad.name(),
+                            gamepad.mapping_source()
+                        )
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        if !detected_gamepads.is_empty() {
+            dualsense_buttons_enabled.store(false, Ordering::Relaxed);
+        }
+        for message in detected_gamepads {
+            ui.push_toast(ui::ToastKind::Success, message);
+        }
 
         Ok(Self {
             surface,
@@ -1070,6 +1164,7 @@ fn fs_main(in: VertexOut) -> @location(0) vec4<f32> {
             feed_error,
             gui,
             ui,
+            dualsense_buttons_enabled,
             last_update: Instant::now(),
             accumulator: 0.0,
             frame_stats: FrameStats::new(120),
@@ -1172,9 +1267,7 @@ fn fs_main(in: VertexOut) -> @location(0) vec4<f32> {
     fn update(&mut self, dt: Duration) {
         self.frame_stats.record(dt);
         let input_state = self.runtime.as_ref().map(|runtime| runtime.input_state());
-        if let Some(input) = input_state {
-            self.poll_gamepads(input);
-        }
+        self.poll_gamepads(input_state);
         if let Some(runtime) = self.runtime.as_mut() {
             self.accumulator += dt.as_secs_f64();
             let frame_time = 1.0 / runtime.fps();
@@ -1190,34 +1283,112 @@ fn fs_main(in: VertexOut) -> @location(0) vec4<f32> {
         }
     }
 
-    fn poll_gamepads(&mut self, input: Arc<Mutex<JoypadState>>) {
-        let Some(gilrs) = self.gilrs.as_mut() else {
-            return;
+    fn handle_gamepad_button(
+        &mut self,
+        button: Button,
+        pressed: bool,
+        input: Option<Arc<Mutex<JoypadState>>>,
+    ) {
+        let context = input::ButtonContext {
+            overlay_visible: self.ui.is_overlay_visible(),
+            official_picker_open: self.ui.is_official_picker_open(),
+            is_editing_text: self.ui.is_editing_text(),
         };
-        let mut events = Vec::new();
-        while let Some(event) = gilrs.next_event() {
-            events.push(event);
+
+        if pressed {
+            if let Some(action) = input::action_from_button(button, true, context) {
+                self.apply_action(action);
+                return;
+            }
         }
-        for event in events {
-            if let EventType::ButtonPressed(button, _) = event.event {
-                if let Some(action) = input::action_from_button(button, true) {
-                    self.apply_action(action);
+
+        if context.capture_gameplay() {
+            return;
+        }
+
+        if let Some(id) = map_gilrs_button(button) {
+            if let Some(input) = input {
+                if let Ok(mut guard) = input.lock() {
+                    guard.set_button(id, pressed);
+                }
+            }
+        }
+    }
+
+    fn poll_gamepads(&mut self, input: Option<Arc<Mutex<JoypadState>>>) {
+        let events = {
+            let Some(gilrs) = self.gilrs.as_mut() else {
+                return;
+            };
+            let mut events = Vec::new();
+            while let Some(event) = gilrs.next_event() {
+                let name = match event.event {
+                    EventType::Connected | EventType::Disconnected => {
+                        Some(gilrs.gamepad(event.id).name().to_string())
+                    }
+                    _ => None,
+                };
+                events.push((event.event, name));
+            }
+            events
+        };
+        let mut saw_disconnect = false;
+        for (event, name) in events {
+            match event {
+                EventType::Connected => {
+                    let name = name.as_deref().unwrap_or("Unknown");
+                    self.ui.push_toast(
+                        ui::ToastKind::Success,
+                        format!("Gamepad connected: {name}"),
+                    );
+                    self.dualsense_buttons_enabled
+                        .store(false, Ordering::Relaxed);
                     continue;
                 }
+                EventType::Disconnected => {
+                    let name = name.as_deref().unwrap_or("Unknown");
+                    self.ui.push_toast(
+                        ui::ToastKind::Error,
+                        format!("Gamepad disconnected: {name}"),
+                    );
+                    saw_disconnect = true;
+                    continue;
+                }
+                _ => {}
             }
 
-            let pressed = matches!(event.event, EventType::ButtonPressed(_, _));
-            let released = matches!(event.event, EventType::ButtonReleased(_, _));
-            let button = match event.event {
-                EventType::ButtonPressed(button, _) => Some(button),
-                EventType::ButtonReleased(button, _) => Some(button),
-                _ => None,
-            };
-            if let Some(id) = button.and_then(map_gilrs_button) {
-                if let Ok(mut guard) = input.lock() {
-                    guard.set_button(id, pressed && !released);
-                }
+            if let EventType::ButtonChanged(button, value, _) = event {
+                let pressed = value >= GAMEPAD_AXIS_THRESHOLD;
+                self.handle_gamepad_button(button, pressed, input.clone());
+                continue;
             }
+
+            if let EventType::AxisChanged(axis, value, _) = event {
+                if let Some(buttons) = axis_to_dpad_buttons(axis, value) {
+                    for (button, pressed) in buttons {
+                        self.handle_gamepad_button(button, pressed, input.clone());
+                    }
+                }
+                continue;
+            }
+
+            if let EventType::ButtonPressed(button, _) = event {
+                self.handle_gamepad_button(button, true, input.clone());
+                continue;
+            }
+            if let EventType::ButtonReleased(button, _) = event {
+                self.handle_gamepad_button(button, false, input.clone());
+                continue;
+            }
+        }
+        if saw_disconnect {
+            let has_gamepad = self
+                .gilrs
+                .as_ref()
+                .map(|gilrs| gilrs.gamepads().next().is_some())
+                .unwrap_or(false);
+            self.dualsense_buttons_enabled
+                .store(!has_gamepad, Ordering::Relaxed);
         }
     }
 
@@ -1251,6 +1422,43 @@ fn fs_main(in: VertexOut) -> @location(0) vec4<f32> {
             Action::PrevItem => self.navigate_feed(-1),
             Action::SelectIndex(index) => self.select_feed_index(index),
             Action::CreateByte => self.create_byte(),
+            Action::BeginRenameCurrent => {
+                let Some(feed) = self.feed.as_ref() else {
+                    return;
+                };
+                let Some(item) = feed.current() else {
+                    return;
+                };
+                self.ui.start_rename(feed.current_index, item.title().to_string());
+            }
+            Action::OpenOfficialPickerCurrent => {
+                let Some(feed) = self.feed.as_ref() else {
+                    return;
+                };
+                let Some(item) = feed.current() else {
+                    return;
+                };
+                if let FeedItem::RomFallback(fallback) = item {
+                    self.ui
+                        .open_official_picker(feed.current_index, fallback, &feed.store);
+                } else {
+                    self.ui.push_toast(
+                        ui::ToastKind::Error,
+                        "Official picker is only available for ROMs.".to_string(),
+                    );
+                }
+            }
+            Action::CancelUi => {
+                self.ui.cancel_active_ui();
+            }
+            Action::OfficialPickerMove(delta) => {
+                self.ui.move_official_picker_selection(delta);
+            }
+            Action::OfficialPickerConfirm => {
+                if let Some((index, title)) = self.ui.confirm_official_picker_selection() {
+                    self.set_official_title(index, title);
+                }
+            }
             Action::RenameTitle { index, title } => self.rename_feed_title(index, title),
             Action::SetOfficialTitle { index, title } => self.set_official_title(index, title),
             Action::ClearOfficialTitle { index } => self.clear_official_title(index),
@@ -1773,6 +1981,8 @@ fn map_gilrs_button(button: Button) -> Option<u32> {
     match button {
         Button::South => Some(RETRO_DEVICE_ID_JOYPAD_B),
         Button::East => Some(RETRO_DEVICE_ID_JOYPAD_A),
+        Button::West => Some(RETRO_DEVICE_ID_JOYPAD_Y),
+        Button::North => Some(RETRO_DEVICE_ID_JOYPAD_X),
         Button::Select => Some(RETRO_DEVICE_ID_JOYPAD_SELECT),
         Button::Start => Some(RETRO_DEVICE_ID_JOYPAD_START),
         Button::DPadUp => Some(RETRO_DEVICE_ID_JOYPAD_UP),
@@ -1985,17 +2195,34 @@ fn main() -> Result<()> {
     let app_config = AppConfig::from_env();
     let event_loop = EventLoopBuilder::<UserEvent>::with_user_event().build()?;
     let proxy = event_loop.create_proxy();
-    let _dualsense_thread = dualsense::spawn_dualsense_listener(proxy);
+    let dualsense_buttons_enabled = Arc::new(AtomicBool::new(true));
+    let _dualsense_thread = if app_config.dualsense_swipes {
+        Some(dualsense::spawn_dualsense_listener(
+            proxy,
+            Arc::clone(&dualsense_buttons_enabled),
+        ))
+    } else {
+        None
+    };
     let window = WindowBuilder::new()
         .with_title("Playbyte")
         .build(&event_loop)?;
-    let mut state = pollster::block_on(State::new(&window, app_config))?;
+    let mut state = pollster::block_on(State::new(
+        &window,
+        app_config,
+        Arc::clone(&dualsense_buttons_enabled),
+    ))?;
 
     event_loop.run(move |event, elwt| {
         state.gui.handle_event(&window, &event);
         match event {
             Event::UserEvent(UserEvent::Action(action)) => {
                 state.apply_action(action);
+                window.request_redraw();
+            }
+            Event::UserEvent(UserEvent::GamepadButton { button, pressed }) => {
+                let input = state.runtime.as_ref().map(|runtime| runtime.input_state());
+                state.handle_gamepad_button(button, pressed, input);
                 window.request_redraw();
             }
             Event::WindowEvent { event, window_id } if window_id == window.id() => match event {
