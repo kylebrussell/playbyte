@@ -897,6 +897,9 @@ struct State {
     gui: GuiState,
     ui: ui::UiState,
     dualsense_buttons_enabled: Arc<AtomicBool>,
+    l2_held: bool,
+    r2_held: bool,
+    overlay_toggle_armed: bool,
     last_update: Instant,
     accumulator: f64,
     frame_stats: FrameStats,
@@ -1165,6 +1168,9 @@ fn fs_main(in: VertexOut) -> @location(0) vec4<f32> {
             gui,
             ui,
             dualsense_buttons_enabled,
+            l2_held: false,
+            r2_held: false,
+            overlay_toggle_armed: true,
             last_update: Instant::now(),
             accumulator: 0.0,
             frame_stats: FrameStats::new(120),
@@ -1289,6 +1295,24 @@ fn fs_main(in: VertexOut) -> @location(0) vec4<f32> {
         pressed: bool,
         input: Option<Arc<Mutex<JoypadState>>>,
     ) {
+        if button == Button::LeftTrigger2 {
+            self.l2_held = pressed;
+        } else if button == Button::RightTrigger2 {
+            self.r2_held = pressed;
+        }
+
+        if self.l2_held && self.r2_held {
+            if self.overlay_toggle_armed {
+                self.overlay_toggle_armed = false;
+                self.apply_action(Action::ToggleOverlay);
+            }
+            return;
+        }
+
+        if !self.l2_held && !self.r2_held {
+            self.overlay_toggle_armed = true;
+        }
+
         let context = input::ButtonContext {
             overlay_visible: self.ui.is_overlay_visible(),
             official_picker_open: self.ui.is_official_picker_open(),
@@ -1422,15 +1446,6 @@ fn fs_main(in: VertexOut) -> @location(0) vec4<f32> {
             Action::PrevItem => self.navigate_feed(-1),
             Action::SelectIndex(index) => self.select_feed_index(index),
             Action::CreateByte => self.create_byte(),
-            Action::BeginRenameCurrent => {
-                let Some(feed) = self.feed.as_ref() else {
-                    return;
-                };
-                let Some(item) = feed.current() else {
-                    return;
-                };
-                self.ui.start_rename(feed.current_index, item.title().to_string());
-            }
             Action::OpenOfficialPickerCurrent => {
                 let Some(feed) = self.feed.as_ref() else {
                     return;

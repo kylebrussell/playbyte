@@ -7,7 +7,6 @@ pub enum Action {
     PrevItem,
     ToggleOverlay,
     CreateByte,
-    BeginRenameCurrent,
     OpenOfficialPickerCurrent,
     CancelUi,
     OfficialPickerMove(i32),
@@ -70,22 +69,16 @@ pub fn action_from_button(
 
     if context.overlay_visible {
         return match button {
-            Button::DPadLeft | Button::LeftTrigger | Button::LeftTrigger2 => Some(Action::PrevItem),
-            Button::DPadRight | Button::RightTrigger | Button::RightTrigger2 => {
-                Some(Action::NextItem)
-            }
-            Button::Start => Some(Action::ToggleOverlay),
-            Button::South => Some(Action::ToggleOverlay),
+            Button::DPadLeft => Some(Action::PrevItem),
+            Button::DPadRight => Some(Action::NextItem),
             Button::North => Some(Action::OpenOfficialPickerCurrent),
             Button::West => Some(Action::CreateByte),
-            Button::Select => Some(Action::BeginRenameCurrent),
             Button::East => Some(Action::CancelUi),
             _ => None,
         };
     }
 
     match button {
-        Button::Start => Some(Action::ToggleOverlay),
         _ => None,
     }
 }

@@ -81,7 +81,7 @@ impl UiState {
                 .show(ctx, |ui| {
                     hint_strip(
                         ui,
-                        "Swipe trackpad or L2/R2 to browse • Square/B to bookmark • Options/Tab to hide",
+                        "Swipe trackpad or D-pad to browse • Square/B to bookmark • L2+R2 or Tab to hide",
                         &self.theme,
                     );
                 });
@@ -124,12 +124,6 @@ impl UiState {
 
     pub fn is_official_picker_open(&self) -> bool {
         self.official_picker.is_some()
-    }
-
-    pub fn start_rename(&mut self, index: usize, title: String) {
-        self.rename_target = Some(index);
-        self.rename_draft = title;
-        self.record_interaction();
     }
 
     pub fn cancel_active_ui(&mut self) -> bool {
