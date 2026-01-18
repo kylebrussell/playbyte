@@ -377,6 +377,12 @@ struct RuntimeLoad {
     meta: RuntimeMetadata,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+enum SessionAutosaveKey {
+    Byte(String),
+    Rom(String),
+}
+
 #[derive(Clone)]
 enum FeedItem {
     Byte(ByteMetadata),
@@ -412,6 +418,13 @@ impl FeedItem {
                 }
             }
             FeedItem::RomFallback(fallback) => &fallback.title,
+        }
+    }
+
+    fn session_autosave_key(&self) -> SessionAutosaveKey {
+        match self {
+            FeedItem::Byte(byte) => SessionAutosaveKey::Byte(byte.byte_id.clone()),
+            FeedItem::RomFallback(fallback) => SessionAutosaveKey::Rom(fallback.rom_sha1.clone()),
         }
     }
 
@@ -890,6 +903,7 @@ struct State {
     video_texture: VideoTexture,
     runtime: Option<EmulatorRuntime>,
     runtime_meta: Option<RuntimeMetadata>,
+    session_autosaves: HashMap<SessionAutosaveKey, Vec<u8>>,
     gilrs: Option<Gilrs>,
     audio_stream: Option<cpal::Stream>,
     feed: Option<FeedController>,
@@ -1161,6 +1175,7 @@ fn fs_main(in: VertexOut) -> @location(0) vec4<f32> {
             video_texture,
             runtime,
             runtime_meta,
+            session_autosaves: HashMap::new(),
             gilrs,
             audio_stream,
             feed,
@@ -1586,24 +1601,62 @@ fn fs_main(in: VertexOut) -> @location(0) vec4<f32> {
         }
     }
 
+    fn store_session_autosave(&mut self, key: Option<SessionAutosaveKey>) {
+        let Some(key) = key else {
+            return;
+        };
+        let Some(runtime) = self.runtime.as_ref() else {
+            return;
+        };
+        match runtime.serialize() {
+            Ok(state) => {
+                self.session_autosaves.insert(key, state);
+            }
+            Err(err) => {
+                self.ui
+                    .push_toast(ui::ToastKind::Error, format!("Autosave failed: {err}"));
+            }
+        }
+    }
+
+    fn restore_session_autosave(&mut self, key: Option<SessionAutosaveKey>, load: &mut RuntimeLoad) {
+        let Some(key) = key else {
+            return;
+        };
+        let Some(state) = self.session_autosaves.get(&key) else {
+            return;
+        };
+        if let Err(err) = load.runtime.unserialize(state) {
+            self.ui.push_toast(
+                ui::ToastKind::Error,
+                format!("Autosave restore failed: {err}"),
+            );
+        }
+    }
+
     fn navigate_feed(&mut self, delta: i32) {
-        let has_selection = {
+        let (leaving_key, changed) = {
             let Some(feed) = self.feed.as_mut() else {
                 return;
             };
-
+            let leaving_key = feed.current().map(FeedItem::session_autosave_key);
+            let previous_index = feed.current_index;
             if delta > 0 {
-                feed.next().is_some()
+                feed.next();
             } else if delta < 0 {
-                feed.prev().is_some()
+                feed.prev();
             } else {
-                feed.current().is_some()
+                feed.current();
             }
+            let changed = feed.current_index != previous_index;
+            (leaving_key, changed)
         };
 
-        if !has_selection {
+        if !changed {
             return;
         }
+
+        self.store_session_autosave(leaving_key);
 
         // Libretro cores (and our callback wiring) are effectively single-instance.
         // Drop the current runtime BEFORE constructing the next one to avoid
@@ -1620,7 +1673,12 @@ fn fs_main(in: VertexOut) -> @location(0) vec4<f32> {
         };
 
         match result {
-            Ok(load) => {
+            Ok(mut load) => {
+                let entering_key = self
+                    .feed
+                    .as_ref()
+                    .and_then(|feed| feed.current().map(FeedItem::session_autosave_key));
+                self.restore_session_autosave(entering_key, &mut load);
                 self.apply_runtime_load(load);
                 self.feed_error = None;
                 if let Some(feed) = self.feed.as_ref() {
@@ -1632,16 +1690,22 @@ fn fs_main(in: VertexOut) -> @location(0) vec4<f32> {
     }
 
     fn select_feed_index(&mut self, index: usize) {
-        let selected = {
+        let (leaving_key, changed) = {
             let Some(feed) = self.feed.as_mut() else {
                 return;
             };
-            feed.select(index).is_some()
+            let leaving_key = feed.current().map(FeedItem::session_autosave_key);
+            let previous_index = feed.current_index;
+            feed.select(index);
+            let changed = feed.current_index != previous_index;
+            (leaving_key, changed)
         };
 
-        if !selected {
+        if !changed {
             return;
         }
+
+        self.store_session_autosave(leaving_key);
 
         // See note in `navigate_feed`.
         self.audio_stream = None;
@@ -1656,7 +1720,12 @@ fn fs_main(in: VertexOut) -> @location(0) vec4<f32> {
         };
 
         match result {
-            Ok(load) => {
+            Ok(mut load) => {
+                let entering_key = self
+                    .feed
+                    .as_ref()
+                    .and_then(|feed| feed.current().map(FeedItem::session_autosave_key));
+                self.restore_session_autosave(entering_key, &mut load);
                 self.apply_runtime_load(load);
                 self.feed_error = None;
                 if let Some(feed) = self.feed.as_ref() {
