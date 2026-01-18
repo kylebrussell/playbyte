@@ -1,23 +1,38 @@
 # Playbyte
 
-Playbyte is an open-source, native app for browsing and playing game save
-states ("Bytes"). A carousel at the bottom lets you flip through Bytes—each
-one instantly loads into an emulator, so you can jump straight into the action.
+**Skip to the good part.**
+
+Playbyte lets you jump straight into the best moments of retro games. Browse a
+carousel of savestates—called "Bytes"—and load any of them instantly. No menus,
+no intros, no grinding to get back to where it gets fun.
+
+## Why Playbyte?
+
+- **Instant gratification** — Every Byte drops you directly into gameplay. Pick
+  a boss fight, a tricky platforming section, or a favorite level and you're
+  playing in under a second.
+- **Your games, your moments** — Create Bytes from your own ROM collection.
+  Capture the exact frame you want to revisit or share.
+- **Works offline** — Everything runs locally. Your ROMs and savestates stay on
+  your machine.
+- **Controller-friendly** — Play with keyboard or gamepad. DualSense touchpad
+  swipe is supported for browsing.
+
+## Supported Systems
+
+NES, SNES, Game Boy Color, and Game Boy Advance (via libretro cores).
+
+## How It Works
+
+1. Point Playbyte at a folder of ROMs you legally own.
+2. The app scans and identifies your games automatically (using No-Intro
+   databases) and fetches cover art.
+3. Play a game, then press **B** to save a Byte at any moment.
+4. Browse your Bytes in the carousel and jump back in whenever you want.
 
 ## Status
 
-Playbyte is an early prototype and is under active development.
-
-## Features
-
-- Carousel UI for browsing and launching Bytes (savestates).
-- Local, offline-first Byte storage.
-- Supported systems: **NES**, **SNES**, **GBC**, **GBA** (via libretro cores).
-- ROM library scanning by SHA-1 (Bytes reference ROM hashes; ROMs are never shipped).
-- Official title detection via No-Intro `.dat` files (from `libretro-database`) with fuzzy matching.
-- Cover art downloading from the libretro thumbnails repository, cached locally.
-- Rename support for Bytes and ROM title fallbacks.
-- Keyboard + controller navigation (DualSense touchpad swipe supported).
+Playbyte is an early prototype under active development. Expect rough edges.
 
 ## Development
 
@@ -74,12 +89,25 @@ You’ll typically see the following appear under `data/`:
 - `data/rom_titles.json`: user-defined title overrides
 - `data/rom_official_overrides.json`: manual “official title” selection overrides
 
-## Controls (current)
+## Controls
 
-- **PageUp / PageDown**: previous / next item
-- **Tab**: toggle overlay
-- **B**: create Byte (save state)
-- **Controller L2 / R2**: previous / next item
+### App Navigation
+
+| Action | Keyboard | Controller |
+|--------|----------|------------|
+| Previous / Next Byte | PageUp / PageDown | L2 / R2 |
+| Toggle overlay | Tab | — |
+| Create Byte | B | — |
+
+### In-Game (Keyboard)
+
+| Game Input | Key |
+|------------|-----|
+| D-Pad | Arrow keys |
+| A | X |
+| B | Z |
+| Start | Enter |
+| Select | Shift |
 
 ## Docs
 
