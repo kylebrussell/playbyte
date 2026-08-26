@@ -77,10 +77,8 @@ fn listen_for_swipes(
                 if !seen_buttons {
                     last_buttons = buttons;
                     seen_buttons = true;
-                } else {
-                    if emit_button_changes(&mut last_buttons, buttons, proxy) {
-                        return Ok(());
-                    }
+                } else if emit_button_changes(&mut last_buttons, buttons, proxy) {
+                    return Ok(());
                 }
             }
         }
@@ -182,16 +180,17 @@ fn emit_button_changes(
     ];
 
     for (button, before, after) in changes {
-        if before != after {
-            if proxy
-                .send_event(UserEvent::GamepadButton {
-                    button,
-                    pressed: after,
-                })
-                .is_err()
-            {
-                return true;
-            }
+        if before == after {
+            continue;
+        }
+        if proxy
+            .send_event(UserEvent::GamepadButton {
+                button,
+                pressed: after,
+            })
+            .is_err()
+        {
+            return true;
         }
     }
 

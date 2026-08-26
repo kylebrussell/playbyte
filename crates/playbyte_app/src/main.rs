@@ -10,7 +10,7 @@ use gilrs::{Axis, Button, EventType, Gilrs};
 use image::codecs::png::PngEncoder;
 use image::{ColorType, ImageEncoder};
 use playbyte_emulation::{
-    AudioRingBuffer, EmulatorRuntime, JoypadState, RETRO_DEVICE_ID_JOYPAD_A,
+    AudioRingBuffer, EmulatorRuntime, JoypadState, LinearResampler, RETRO_DEVICE_ID_JOYPAD_A,
     RETRO_DEVICE_ID_JOYPAD_B, RETRO_DEVICE_ID_JOYPAD_DOWN, RETRO_DEVICE_ID_JOYPAD_L,
     RETRO_DEVICE_ID_JOYPAD_LEFT, RETRO_DEVICE_ID_JOYPAD_R, RETRO_DEVICE_ID_JOYPAD_RIGHT,
     RETRO_DEVICE_ID_JOYPAD_SELECT, RETRO_DEVICE_ID_JOYPAD_START, RETRO_DEVICE_ID_JOYPAD_UP,
@@ -81,6 +81,32 @@ const VERTICES: &[Vertex] = &[
 ];
 
 const INDICES: &[u16] = &[0, 1, 2, 0, 2, 3];
+
+/// Aspect ratio assumed for the placeholder texture before a core reports one.
+const PLACEHOLDER_ASPECT_RATIO: f32 = 4.0 / 3.0;
+
+/// Scale the fullscreen quad to the largest centered rect that fits the surface
+/// while preserving `content_aspect`. Returns the four vertices in the same
+/// order as `VERTICES` (UVs untouched; black bars come from the clear color).
+fn letterboxed_vertices(surface_aspect: f32, content_aspect: f32) -> [Vertex; 4] {
+    let (half_x, half_y) = if content_aspect >= surface_aspect {
+        // Content is wider than the surface: fill width, bar top/bottom.
+        (1.0, surface_aspect / content_aspect)
+    } else {
+        // Content is taller than the surface: fill height, bar left/right.
+        (content_aspect / surface_aspect, 1.0)
+    };
+    let positions = [[-1.0, -1.0], [1.0, -1.0], [1.0, 1.0], [-1.0, 1.0]];
+    let uvs = [[0.0, 1.0], [1.0, 1.0], [1.0, 0.0], [0.0, 0.0]];
+    let mut out = [VERTICES[0]; 4];
+    for (i, vertex) in out.iter_mut().enumerate() {
+        *vertex = Vertex {
+            position: [positions[i][0] * half_x, positions[i][1] * half_y, 0.0],
+            uv: uvs[i],
+        };
+    }
+    out
+}
 
 const SDL_GAMECONTROLLERCONFIG: &str = "SDL_GAMECONTROLLERCONFIG";
 const DUALSENSE_USB_MAPPING: &str = "050000004c050000e60c000000010000,PS5 Controller,a:b1,b:b2,back:b8,dpdown:h0.4,dpleft:h0.8,dpright:h0.2,dpup:h0.1,guide:b12,leftshoulder:b4,leftstick:b10,lefttrigger:a3,leftx:a0,lefty:a1,misc1:b14,rightshoulder:b5,rightstick:b11,righttrigger:a4,rightx:a2,righty:a5,start:b9,touchpad:b13,x:b0,y:b3,platform:Mac OS X,";
@@ -281,16 +307,13 @@ fn resolve_assets_root() -> Option<PathBuf> {
         }
     }
 
-    for candidate in expanded {
-        if has_asset_dirs(&candidate) {
-            return Some(candidate);
-        }
-    }
-    None
+    expanded
+        .into_iter()
+        .find(|candidate| has_asset_dirs(candidate))
 }
 
-fn find_repo_root(start: &PathBuf) -> Option<PathBuf> {
-    let mut current = start.clone();
+fn find_repo_root(start: &Path) -> Option<PathBuf> {
+    let mut current = start.to_path_buf();
     loop {
         if current.join(".git").exists() || current.join("Cargo.toml").exists() {
             return Some(current);
@@ -302,7 +325,7 @@ fn find_repo_root(start: &PathBuf) -> Option<PathBuf> {
     None
 }
 
-fn has_asset_dirs(root: &PathBuf) -> bool {
+fn has_asset_dirs(root: &Path) -> bool {
     root.join("data").exists() || root.join("roms").exists() || root.join("cores").exists()
 }
 
@@ -317,13 +340,16 @@ fn default_data_root() -> Option<PathBuf> {
     } else if cfg!(target_os = "windows") {
         std::env::var_os("APPDATA").map(|appdata| PathBuf::from(appdata).join("Playbyte"))
     } else {
-        if let Some(xdg) = std::env::var_os("XDG_DATA_HOME") {
-            Some(PathBuf::from(xdg).join("playbyte"))
-        } else if let Some(home) = std::env::var_os("HOME") {
-            Some(PathBuf::from(home).join(".local").join("share").join("playbyte"))
-        } else {
-            None
-        }
+        std::env::var_os("XDG_DATA_HOME")
+            .map(|xdg| PathBuf::from(xdg).join("playbyte"))
+            .or_else(|| {
+                std::env::var_os("HOME").map(|home| {
+                    PathBuf::from(home)
+                        .join(".local")
+                        .join("share")
+                        .join("playbyte")
+                })
+            })
     }
 }
 
@@ -403,8 +429,8 @@ struct RomFallback {
 impl FeedItem {
     fn system(&self) -> System {
         match self {
-            FeedItem::Byte(byte) => byte.system.clone(),
-            FeedItem::RomFallback(fallback) => fallback.system.clone(),
+            FeedItem::Byte(byte) => byte.system,
+            FeedItem::RomFallback(fallback) => fallback.system,
         }
     }
 
@@ -427,7 +453,6 @@ impl FeedItem {
             FeedItem::RomFallback(fallback) => SessionAutosaveKey::Rom(fallback.rom_sha1.clone()),
         }
     }
-
 }
 
 struct FeedController {
@@ -450,8 +475,14 @@ impl FeedController {
         let _ = roms.scan()?;
 
         let core_locator = CoreLocator::new(config.cores_root.clone());
-        let items =
-            build_feed_items(&store, &core_locator, &roms, &bytes, &rom_titles, &rom_overrides)?;
+        let items = build_feed_items(
+            &store,
+            &core_locator,
+            &roms,
+            &bytes,
+            &rom_titles,
+            &rom_overrides,
+        )?;
 
         Ok(Self {
             store,
@@ -517,7 +548,9 @@ impl FeedController {
     }
 
     fn build_runtime_for_current(&self) -> Result<RuntimeLoad> {
-        let item = self.current().context("no selected item available in feed")?;
+        let item = self
+            .current()
+            .context("no selected item available in feed")?;
         match item {
             FeedItem::Byte(byte) => {
                 let core_path = self
@@ -552,7 +585,7 @@ impl FeedController {
                     core_version: byte.core_semver.clone(),
                     rom_sha1: byte.rom_sha1.clone(),
                     _rom_path: rom_path,
-                    system: byte.system.clone(),
+                    system: byte.system,
                 };
                 Ok(RuntimeLoad { runtime, meta })
             }
@@ -580,11 +613,7 @@ impl FeedController {
         self.current_index = self.items.len().saturating_sub(1);
     }
 
-    fn add_fallback_rom(
-        &mut self,
-        rom_path: PathBuf,
-        core_path: Option<PathBuf>,
-    ) -> Result<()> {
+    fn add_fallback_rom(&mut self, rom_path: PathBuf, core_path: Option<PathBuf>) -> Result<()> {
         let rom_sha1 = hash_rom(&rom_path)?;
         if self.items.iter().any(|item| match item {
             FeedItem::Byte(byte) => byte.rom_sha1 == rom_sha1,
@@ -606,7 +635,7 @@ impl FeedController {
                     FeedItem::RomFallback(_) => None,
                 })
                 .collect();
-            select_default_core(system.clone(), &available_cores, &bytes, &self.core_locator)
+            select_default_core(system, &available_cores, &bytes, &self.core_locator)
                 .ok_or_else(|| anyhow::anyhow!("no core available for fallback ROM"))?
         };
         let rom_titles = self.store.load_rom_titles()?;
@@ -619,7 +648,7 @@ impl FeedController {
             &self.store,
             &rom_sha1,
             &rom_path,
-            system.clone(),
+            system,
             &title,
             &rom_overrides,
         );
@@ -648,7 +677,8 @@ fn build_feed_items(
     rom_overrides: &HashMap<String, String>,
 ) -> Result<Vec<FeedItem>> {
     let mut items: Vec<FeedItem> = bytes.iter().cloned().map(FeedItem::Byte).collect();
-    let mut covered_roms: HashSet<String> = bytes.iter().map(|byte| byte.rom_sha1.clone()).collect();
+    let mut covered_roms: HashSet<String> =
+        bytes.iter().map(|byte| byte.rom_sha1.clone()).collect();
 
     let available_cores = list_core_ids(&core_locator.root);
     let nes_core = select_default_core(System::Nes, &available_cores, bytes, core_locator);
@@ -676,14 +706,8 @@ fn build_feed_items(
             .get(&rom_sha1)
             .cloned()
             .unwrap_or_else(|| title_from_rom_path(&rom_path));
-        let official_title = resolve_official_title(
-            store,
-            &rom_sha1,
-            &rom_path,
-            system.clone(),
-            &title,
-            rom_overrides,
-        );
+        let official_title =
+            resolve_official_title(store, &rom_sha1, &rom_path, system, &title, rom_overrides);
         items.push(FeedItem::RomFallback(RomFallback {
             rom_sha1: rom_sha1.clone(),
             rom_path,
@@ -743,14 +767,16 @@ fn resolve_official_title(
     None
 }
 
-fn core_id_from_path(path: &PathBuf) -> Option<String> {
+fn core_id_from_path(path: &Path) -> Option<String> {
     let filename = path.file_name()?.to_str()?;
     if let Some((core_id, _)) = filename.split_once("_libretro.") {
         if !core_id.is_empty() {
             return Some(core_id.to_string());
         }
     }
-    path.file_stem().and_then(|stem| stem.to_str()).map(|stem| stem.to_string())
+    path.file_stem()
+        .and_then(|stem| stem.to_str())
+        .map(|stem| stem.to_string())
 }
 
 fn list_core_ids(root: &PathBuf) -> Vec<String> {
@@ -904,6 +930,8 @@ struct State {
     runtime: Option<EmulatorRuntime>,
     runtime_meta: Option<RuntimeMetadata>,
     session_autosaves: HashMap<SessionAutosaveKey, Vec<u8>>,
+    /// Aspect ratio of the texture currently bound to the video pipeline.
+    video_aspect: f32,
     gilrs: Option<Gilrs>,
     audio_stream: Option<cpal::Stream>,
     feed: Option<FeedController>,
@@ -1068,8 +1096,11 @@ fn fs_main(in: VertexOut) -> @location(0) vec4<f32> {
 
         let vertex_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("video-vertex-buffer"),
-            contents: bytemuck::cast_slice(VERTICES),
-            usage: wgpu::BufferUsages::VERTEX,
+            contents: bytemuck::cast_slice(&letterboxed_vertices(
+                size.width.max(1) as f32 / size.height.max(1) as f32,
+                PLACEHOLDER_ASPECT_RATIO,
+            )),
+            usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
         });
         let index_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("video-index-buffer"),
@@ -1077,36 +1108,36 @@ fn fs_main(in: VertexOut) -> @location(0) vec4<f32> {
             usage: wgpu::BufferUsages::INDEX,
         });
 
-    let mut feed = None;
-    let mut feed_error = None;
-    let mut runtime_load: Option<RuntimeLoad> = None;
+        let mut feed = None;
+        let mut feed_error = None;
+        let mut runtime_load: Option<RuntimeLoad> = None;
 
-    match FeedController::load(&app_config) {
-        Ok(controller) => {
-            if controller.is_empty() {
-                feed_error = Some("No Bytes or ROMs found to build the feed.".to_string());
+        match FeedController::load(&app_config) {
+            Ok(controller) => {
+                if controller.is_empty() {
+                    feed_error = Some("No Bytes or ROMs found to build the feed.".to_string());
+                }
+                feed = Some(controller);
             }
-            feed = Some(controller);
+            Err(err) => feed_error = Some(format!("Feed error: {err}")),
         }
-        Err(err) => feed_error = Some(format!("Feed error: {err}")),
-    }
 
-    if let (Some(core), Some(rom)) = (app_config.core_path.clone(), app_config.rom_path.clone())
-    {
-        if let Some(controller) = feed.as_mut() {
-            if let Err(err) = controller.add_fallback_rom(rom, Some(core)) {
-                feed_error = Some(format!("Feed ROM error: {err}"));
-            }
-        } else {
-            match EmulatorRuntime::new(core, rom.clone()) {
-                Ok(rt) => match build_runtime_meta_from_runtime(&rt, &rom) {
-                    Ok(meta) => runtime_load = Some(RuntimeLoad { runtime: rt, meta }),
-                    Err(err) => feed_error = Some(format!("Runtime meta error: {err}")),
-                },
-                Err(err) => feed_error = Some(format!("Runtime error: {err}")),
+        if let (Some(core), Some(rom)) = (app_config.core_path.clone(), app_config.rom_path.clone())
+        {
+            if let Some(controller) = feed.as_mut() {
+                if let Err(err) = controller.add_fallback_rom(rom, Some(core)) {
+                    feed_error = Some(format!("Feed ROM error: {err}"));
+                }
+            } else {
+                match EmulatorRuntime::new(core, rom.clone()) {
+                    Ok(rt) => match build_runtime_meta_from_runtime(&rt, &rom) {
+                        Ok(meta) => runtime_load = Some(RuntimeLoad { runtime: rt, meta }),
+                        Err(err) => feed_error = Some(format!("Runtime meta error: {err}")),
+                    },
+                    Err(err) => feed_error = Some(format!("Runtime error: {err}")),
+                }
             }
         }
-    }
 
         if let Some(controller) = &feed {
             if !controller.is_empty() {
@@ -1121,6 +1152,13 @@ fn fs_main(in: VertexOut) -> @location(0) vec4<f32> {
             controller.prefetch_neighbors();
         }
 
+        // The first runtime skips apply_runtime_load, so capture its aspect
+        // ratio here; otherwise the initial item renders at 4:3 until the user
+        // navigates.
+        let initial_video_aspect = runtime_load
+            .as_ref()
+            .map(|load| load.runtime.aspect_ratio())
+            .unwrap_or(PLACEHOLDER_ASPECT_RATIO);
         let (runtime, runtime_meta) = match runtime_load {
             Some(load) => (Some(load.runtime), Some(load.meta)),
             None => (None, None),
@@ -1132,7 +1170,7 @@ fn fs_main(in: VertexOut) -> @location(0) vec4<f32> {
         };
         let audio_stream = runtime
             .as_ref()
-            .and_then(|rt| build_audio_stream(rt.audio_buffer()).ok());
+            .and_then(|rt| build_audio_stream(rt.audio_buffer(), rt.sample_rate()).ok());
 
         let gui = GuiState::new(window, &device, surface_config.format);
         let mut ui = ui::UiState::new(&gui.ctx);
@@ -1161,7 +1199,7 @@ fn fs_main(in: VertexOut) -> @location(0) vec4<f32> {
             ui.push_toast(ui::ToastKind::Success, message);
         }
 
-        Ok(Self {
+        let mut state = Self {
             surface,
             device,
             queue,
@@ -1176,6 +1214,7 @@ fn fs_main(in: VertexOut) -> @location(0) vec4<f32> {
             runtime,
             runtime_meta,
             session_autosaves: HashMap::new(),
+            video_aspect: initial_video_aspect,
             gilrs,
             audio_stream,
             feed,
@@ -1190,7 +1229,21 @@ fn fs_main(in: VertexOut) -> @location(0) vec4<f32> {
             accumulator: 0.0,
             frame_stats: FrameStats::new(120),
             data_root: app_config.data_root,
-        })
+        };
+        state.update_video_quad();
+        Ok(state)
+    }
+
+    /// Rewrite the video quad vertices so the texture is letterboxed to the
+    /// current surface size and content aspect ratio.
+    fn update_video_quad(&mut self) {
+        if self.size.width == 0 || self.size.height == 0 {
+            return;
+        }
+        let surface_aspect = self.size.width as f32 / self.size.height as f32;
+        let vertices = letterboxed_vertices(surface_aspect, self.video_aspect);
+        self.queue
+            .write_buffer(&self.vertex_buffer, 0, bytemuck::cast_slice(&vertices));
     }
 
     fn create_placeholder_texture(
@@ -1282,6 +1335,7 @@ fn fs_main(in: VertexOut) -> @location(0) vec4<f32> {
             self.config.width = new_size.width;
             self.config.height = new_size.height;
             self.surface.configure(&self.device, &self.config);
+            self.update_video_quad();
         }
     }
 
@@ -1376,10 +1430,8 @@ fn fs_main(in: VertexOut) -> @location(0) vec4<f32> {
             match event {
                 EventType::Connected => {
                     let name = name.as_deref().unwrap_or("Unknown");
-                    self.ui.push_toast(
-                        ui::ToastKind::Success,
-                        format!("Gamepad connected: {name}"),
-                    );
+                    self.ui
+                        .push_toast(ui::ToastKind::Success, format!("Gamepad connected: {name}"));
                     self.dualsense_buttons_enabled
                         .store(false, Ordering::Relaxed);
                     continue;
@@ -1432,11 +1484,27 @@ fn fs_main(in: VertexOut) -> @location(0) vec4<f32> {
     }
 
     fn handle_keyboard(&mut self, key: KeyCode, pressed: bool) {
-        if self.ui.is_editing_text() {
+        let context = input::KeyContext {
+            official_picker_open: self.ui.is_official_picker_open(),
+            is_editing_text: self.ui.is_editing_text(),
+        };
+
+        // While a text field has focus (e.g. the rename box) egui owns the
+        // keyboard for input, but still let Escape through so the edit can be
+        // dismissed.
+        if context.is_editing_text {
+            if pressed && key == KeyCode::Escape {
+                self.apply_action(Action::CancelUi);
+            }
             return;
         }
-        if let Some(action) = input::action_from_key(key, pressed) {
+        if let Some(action) = input::action_from_key(key, pressed, context) {
             self.apply_action(action);
+            return;
+        }
+        if context.official_picker_open {
+            // The picker owns navigation; don't let remaining gameplay keys
+            // reach the running core (mirrors ButtonContext::capture_gameplay).
             return;
         }
         if self.gui.ctx.wants_keyboard_input() {
@@ -1545,29 +1613,24 @@ fn fs_main(in: VertexOut) -> @location(0) vec4<f32> {
         };
         let store = feed.store.clone();
         let trimmed = title.trim();
-        match item {
-            FeedItem::RomFallback(mut fallback) => {
-                if let Err(err) = store.set_rom_official_override(&fallback.rom_sha1, Some(trimmed)) {
-                    let message = format!("Official game update failed: {err}");
-                    self.feed_error = Some(message.clone());
-                    self.ui.push_toast(ui::ToastKind::Error, message);
-                    return;
-                }
-                fallback.official_title = if trimmed.is_empty() {
-                    None
-                } else {
-                    Some(trimmed.to_string())
-                };
-                let rom_sha1 = fallback.rom_sha1.clone();
-                feed.items[index] = FeedItem::RomFallback(fallback);
-                self.ui.invalidate_cover_art(&rom_sha1);
-                self.feed_error = None;
-                self.ui.push_toast(
-                    ui::ToastKind::Success,
-                    "Official game updated".to_string(),
-                );
+        if let FeedItem::RomFallback(mut fallback) = item {
+            if let Err(err) = store.set_rom_official_override(&fallback.rom_sha1, Some(trimmed)) {
+                let message = format!("Official game update failed: {err}");
+                self.feed_error = Some(message.clone());
+                self.ui.push_toast(ui::ToastKind::Error, message);
+                return;
             }
-            _ => {}
+            fallback.official_title = if trimmed.is_empty() {
+                None
+            } else {
+                Some(trimmed.to_string())
+            };
+            let rom_sha1 = fallback.rom_sha1.clone();
+            feed.items[index] = FeedItem::RomFallback(fallback);
+            self.ui.invalidate_cover_art(&rom_sha1);
+            self.feed_error = None;
+            self.ui
+                .push_toast(ui::ToastKind::Success, "Official game updated".to_string());
         }
     }
 
@@ -1579,25 +1642,20 @@ fn fs_main(in: VertexOut) -> @location(0) vec4<f32> {
             return;
         };
         let store = feed.store.clone();
-        match item {
-            FeedItem::RomFallback(mut fallback) => {
-                if let Err(err) = store.set_rom_official_override(&fallback.rom_sha1, None) {
-                    let message = format!("Official game update failed: {err}");
-                    self.feed_error = Some(message.clone());
-                    self.ui.push_toast(ui::ToastKind::Error, message);
-                    return;
-                }
-                fallback.official_title = None;
-                let rom_sha1 = fallback.rom_sha1.clone();
-                feed.items[index] = FeedItem::RomFallback(fallback);
-                self.ui.invalidate_cover_art(&rom_sha1);
-                self.feed_error = None;
-                self.ui.push_toast(
-                    ui::ToastKind::Success,
-                    "Official game cleared".to_string(),
-                );
+        if let FeedItem::RomFallback(mut fallback) = item {
+            if let Err(err) = store.set_rom_official_override(&fallback.rom_sha1, None) {
+                let message = format!("Official game update failed: {err}");
+                self.feed_error = Some(message.clone());
+                self.ui.push_toast(ui::ToastKind::Error, message);
+                return;
             }
-            _ => {}
+            fallback.official_title = None;
+            let rom_sha1 = fallback.rom_sha1.clone();
+            feed.items[index] = FeedItem::RomFallback(fallback);
+            self.ui.invalidate_cover_art(&rom_sha1);
+            self.feed_error = None;
+            self.ui
+                .push_toast(ui::ToastKind::Success, "Official game cleared".to_string());
         }
     }
 
@@ -1619,7 +1677,11 @@ fn fs_main(in: VertexOut) -> @location(0) vec4<f32> {
         }
     }
 
-    fn restore_session_autosave(&mut self, key: Option<SessionAutosaveKey>, load: &mut RuntimeLoad) {
+    fn restore_session_autosave(
+        &mut self,
+        key: Option<SessionAutosaveKey>,
+        load: &mut RuntimeLoad,
+    ) {
         let Some(key) = key else {
             return;
         };
@@ -1737,8 +1799,11 @@ fn fs_main(in: VertexOut) -> @location(0) vec4<f32> {
     }
 
     fn apply_runtime_load(&mut self, load: RuntimeLoad) {
-        self.audio_stream = build_audio_stream(load.runtime.audio_buffer()).ok();
+        self.audio_stream =
+            build_audio_stream(load.runtime.audio_buffer(), load.runtime.sample_rate()).ok();
         self.runtime_meta = Some(load.meta);
+        self.video_aspect = load.runtime.aspect_ratio();
+        self.update_video_quad();
         self.runtime = Some(load.runtime);
         self.accumulator = 0.0;
         self.ui.trigger_transition();
@@ -1760,10 +1825,8 @@ fn fs_main(in: VertexOut) -> @location(0) vec4<f32> {
             Some(meta) => meta.clone(),
             None => {
                 self.feed_error = Some("Missing runtime metadata".to_string());
-                self.ui.push_toast(
-                    ui::ToastKind::Error,
-                    "Missing runtime metadata".to_string(),
-                );
+                self.ui
+                    .push_toast(ui::ToastKind::Error, "Missing runtime metadata".to_string());
                 return;
             }
         };
@@ -1782,10 +1845,8 @@ fn fs_main(in: VertexOut) -> @location(0) vec4<f32> {
             Ok(state) => state,
             Err(err) => {
                 self.feed_error = Some(format!("Serialize failed: {err}"));
-                self.ui.push_toast(
-                    ui::ToastKind::Error,
-                    format!("Serialize failed: {err}"),
-                );
+                self.ui
+                    .push_toast(ui::ToastKind::Error, format!("Serialize failed: {err}"));
                 return;
             }
         };
@@ -1793,10 +1854,8 @@ fn fs_main(in: VertexOut) -> @location(0) vec4<f32> {
             Ok(png) => png,
             Err(err) => {
                 self.feed_error = Some(format!("Thumbnail failed: {err}"));
-                self.ui.push_toast(
-                    ui::ToastKind::Error,
-                    format!("Thumbnail failed: {err}"),
-                );
+                self.ui
+                    .push_toast(ui::ToastKind::Error, format!("Thumbnail failed: {err}"));
                 return;
             }
         };
@@ -1807,7 +1866,7 @@ fn fs_main(in: VertexOut) -> @location(0) vec4<f32> {
             .unwrap_or_else(|_| "unknown".to_string());
         let metadata = ByteMetadata {
             byte_id: byte_id.clone(),
-            system: meta.system.clone(),
+            system: meta.system,
             core_id: meta.core_id.clone(),
             core_semver: meta.core_version.clone(),
             rom_sha1: meta.rom_sha1.clone(),
@@ -2103,7 +2162,8 @@ fn convert_frame_to_rgba(frame: &playbyte_libretro::VideoFrame) -> Vec<u8> {
 
     let bytes_per_pixel = match frame.pixel_format {
         playbyte_libretro::RetroPixelFormat::Xrgb8888 => 4,
-        playbyte_libretro::RetroPixelFormat::Rgb565 | playbyte_libretro::RetroPixelFormat::_0rgb1555 => 2,
+        playbyte_libretro::RetroPixelFormat::Rgb565
+        | playbyte_libretro::RetroPixelFormat::_0rgb1555 => 2,
     };
     let min_pitch = width.saturating_mul(bytes_per_pixel);
     if frame.pitch < min_pitch {
@@ -2212,7 +2272,7 @@ fn hash_rom(path: &PathBuf) -> Result<String> {
     Ok(format!("{:x}", hasher.finalize()))
 }
 
-fn system_from_rom_path(path: &PathBuf) -> System {
+fn system_from_rom_path(path: &Path) -> System {
     match path
         .extension()
         .and_then(|ext| ext.to_str())
@@ -2226,33 +2286,65 @@ fn system_from_rom_path(path: &PathBuf) -> System {
     }
 }
 
-fn build_audio_stream(audio: Arc<AudioRingBuffer>) -> Result<cpal::Stream> {
+fn build_audio_stream(
+    audio: Arc<AudioRingBuffer>,
+    source_sample_rate: f64,
+) -> Result<cpal::Stream> {
     let host = cpal::default_host();
     let device = host
         .default_output_device()
         .ok_or_else(|| anyhow::anyhow!("No output audio device available"))?;
-    let config = device.default_output_config()?;
+    let mut config = device.default_output_config()?;
+    if config.channels() > 2 {
+        // Multi-channel devices (HDMI, aggregate) would scramble our
+        // interleaved stereo mix; try to negotiate plain stereo instead.
+        if let Some(range) = device
+            .supported_output_configs()?
+            .find(|range| range.channels() == 2)
+        {
+            config = range.with_max_sample_rate();
+        } else {
+            eprintln!(
+                "audio: no stereo output config available; {}-channel device may sound wrong",
+                config.channels()
+            );
+        }
+    }
     let sample_format = config.sample_format();
+    let out_channels = config.channels() as usize;
+    let out_rate = config.sample_rate().0 as f64;
     let stream_config = config.into();
+    let mut resampler = LinearResampler::new(source_sample_rate, out_rate);
+    let mut scratch: Vec<i16> = Vec::new();
+
+    if source_sample_rate != out_rate {
+        eprintln!("audio: resampling core {source_sample_rate:.0} Hz -> output {out_rate:.0} Hz");
+    }
 
     let err_fn = |err| eprintln!("audio stream error: {err}");
 
     let stream = match sample_format {
         cpal::SampleFormat::F32 => device.build_output_stream(
             &stream_config,
-            move |data: &mut [f32], _| write_audio(data, &audio),
+            move |data: &mut [f32], _| {
+                write_audio(data, &audio, &mut resampler, &mut scratch, out_channels)
+            },
             err_fn,
             None,
         )?,
         cpal::SampleFormat::I16 => device.build_output_stream(
             &stream_config,
-            move |data: &mut [i16], _| write_audio(data, &audio),
+            move |data: &mut [i16], _| {
+                write_audio(data, &audio, &mut resampler, &mut scratch, out_channels)
+            },
             err_fn,
             None,
         )?,
         cpal::SampleFormat::U16 => device.build_output_stream(
             &stream_config,
-            move |data: &mut [u16], _| write_audio(data, &audio),
+            move |data: &mut [u16], _| {
+                write_audio(data, &audio, &mut resampler, &mut scratch, out_channels)
+            },
             err_fn,
             None,
         )?,
@@ -2263,13 +2355,21 @@ fn build_audio_stream(audio: Arc<AudioRingBuffer>) -> Result<cpal::Stream> {
     Ok(stream)
 }
 
-fn write_audio<T>(output: &mut [T], audio: &AudioRingBuffer)
-where
+fn write_audio<T>(
+    output: &mut [T],
+    audio: &AudioRingBuffer,
+    resampler: &mut LinearResampler,
+    scratch: &mut Vec<i16>,
+    out_channels: usize,
+) where
     T: cpal::Sample + cpal::FromSample<f32>,
 {
-    let mut temp = vec![0i16; output.len()];
-    audio.pop_samples(&mut temp);
-    for (dst, sample) in output.iter_mut().zip(temp.into_iter()) {
+    // Reuse the scratch buffer across callbacks to avoid per-callback allocs;
+    // `process` overwrites every slot it reports as written.
+    scratch.clear();
+    scratch.resize(output.len(), 0);
+    resampler.process(scratch, out_channels, || audio.pop_frame());
+    for (dst, sample) in output.iter_mut().zip(scratch.iter().copied()) {
         let sample_f32 = sample as f32 / i16::MAX as f32;
         *dst = T::from_sample(sample_f32);
     }

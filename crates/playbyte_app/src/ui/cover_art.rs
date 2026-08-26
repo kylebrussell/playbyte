@@ -52,7 +52,7 @@ impl CoverArtCache {
             });
         }
 
-        if let Ok(data) = store.load_cover_art(fallback.system.clone(), title) {
+        if let Ok(data) = store.load_cover_art(fallback.system, title) {
             if let Some(handle) = load_texture(ctx, key, &data) {
                 self.attempts.remove(key);
                 let size = handle.size();
@@ -78,7 +78,7 @@ impl CoverArtCache {
         }
         if self.mark_inflight(key) {
             let store = store.clone();
-            let system = fallback.system.clone();
+            let system = fallback.system;
             let title = title.clone();
             let key = key.clone();
             let inflight = self.inflight.clone();

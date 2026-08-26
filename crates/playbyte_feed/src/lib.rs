@@ -73,17 +73,38 @@ impl LocalByteStore {
 
         let mut entries = Vec::new();
         for entry in fs::read_dir(bytes_root)? {
-            let entry = entry?;
-            if !entry.file_type()?.is_dir() {
+            // A single unreadable directory entry should not fail the whole feed.
+            let Ok(entry) = entry else { continue };
+            let Ok(file_type) = entry.file_type() else {
+                continue;
+            };
+            if !file_type.is_dir() {
                 continue;
             }
-            let byte_dir = entry.path();
-            let byte_json = byte_dir.join("byte.json");
+            let byte_json = entry.path().join("byte.json");
             if !byte_json.exists() {
                 continue;
             }
-            let data = fs::read_to_string(&byte_json)?;
-            let metadata: ByteMetadata = serde_json::from_str(&data)?;
+            let data = match fs::read_to_string(&byte_json) {
+                Ok(data) => data,
+                Err(err) => {
+                    eprintln!(
+                        "playbyte_feed: skipping unreadable {}: {err}",
+                        byte_json.display()
+                    );
+                    continue;
+                }
+            };
+            let metadata: ByteMetadata = match serde_json::from_str(&data) {
+                Ok(metadata) => metadata,
+                Err(err) => {
+                    eprintln!(
+                        "playbyte_feed: skipping malformed {}: {err}",
+                        byte_json.display()
+                    );
+                    continue;
+                }
+            };
             entries.push(metadata);
         }
 
@@ -190,7 +211,10 @@ impl LocalByteStore {
         fs::write(metadata_path, serialized)?;
 
         if let Ok(mut guard) = self.index.lock() {
-            if let Some(entry) = guard.iter_mut().find(|entry| entry.byte_id == metadata.byte_id) {
+            if let Some(entry) = guard
+                .iter_mut()
+                .find(|entry| entry.byte_id == metadata.byte_id)
+            {
                 *entry = metadata.clone();
             } else {
                 guard.push(metadata.clone());
@@ -436,4 +460,51 @@ fn hash_file(path: &Path) -> Result<String, FeedError> {
     let mut hasher = Sha1::new();
     hasher.update(data);
     Ok(format!("{:x}", hasher.finalize()))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn write_byte(root: &Path, byte_id: &str, contents: &str) {
+        let dir = root.join("bytes").join(byte_id);
+        fs::create_dir_all(&dir).expect("create byte dir");
+        fs::write(dir.join("byte.json"), contents).expect("write byte.json");
+    }
+
+    #[test]
+    fn load_index_skips_corrupt_entries() {
+        let root = std::env::temp_dir().join(format!("playbyte_feed_test_{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        let store = LocalByteStore::new(&root);
+
+        write_byte(
+            &root,
+            "good-byte",
+            r#"{
+                "byte_id": "good-byte",
+                "system": "nes",
+                "core_id": "mesen",
+                "core_semver": "1.0.0",
+                "rom_sha1": "abc123",
+                "region": null,
+                "title": "Good Byte",
+                "description": "",
+                "tags": [],
+                "author": "local",
+                "created_at": "2026-01-17T00:00:00Z",
+                "thumbnail_path": "thumbnail.png",
+                "state_path": "state.zst"
+            }"#,
+        );
+        write_byte(&root, "bad-json", "{ not valid json");
+        // Missing required fields.
+        write_byte(&root, "missing-fields", r#"{"byte_id": "missing-fields"}"#);
+
+        let entries = store.load_index().expect("load_index should succeed");
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].byte_id, "good-byte");
+
+        fs::remove_dir_all(&root).ok();
+    }
 }

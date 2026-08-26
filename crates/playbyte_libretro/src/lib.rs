@@ -156,20 +156,25 @@ impl Symbols {
     }
 }
 
+pub type VideoRefreshCallback = Box<dyn Fn(&[u8], u32, u32, usize, RetroPixelFormat) + Send + Sync>;
+pub type AudioSampleBatchCallback = Box<dyn Fn(&[i16]) + Send + Sync>;
+pub type InputPollCallback = Box<dyn Fn() + Send + Sync>;
+pub type InputStateCallback = Box<dyn Fn(u32, u32, u32, u32) -> i16 + Send + Sync>;
+
 pub struct Callbacks {
-    pub video_refresh: Box<dyn Fn(&[u8], u32, u32, usize, RetroPixelFormat) + Send + Sync>,
-    pub audio_sample_batch: Box<dyn Fn(&[i16]) + Send + Sync>,
-    pub input_poll: Box<dyn Fn() + Send + Sync>,
-    pub input_state: Box<dyn Fn(u32, u32, u32, u32) -> i16 + Send + Sync>,
+    pub video_refresh: VideoRefreshCallback,
+    pub audio_sample_batch: AudioSampleBatchCallback,
+    pub input_poll: InputPollCallback,
+    pub input_state: InputStateCallback,
     pixel_format: Mutex<RetroPixelFormat>,
 }
 
 impl Callbacks {
     pub fn new(
-        video_refresh: Box<dyn Fn(&[u8], u32, u32, usize, RetroPixelFormat) + Send + Sync>,
-        audio_sample_batch: Box<dyn Fn(&[i16]) + Send + Sync>,
-        input_poll: Box<dyn Fn() + Send + Sync>,
-        input_state: Box<dyn Fn(u32, u32, u32, u32) -> i16 + Send + Sync>,
+        video_refresh: VideoRefreshCallback,
+        audio_sample_batch: AudioSampleBatchCallback,
+        input_poll: InputPollCallback,
+        input_state: InputStateCallback,
     ) -> Self {
         Self {
             video_refresh,
@@ -533,7 +538,9 @@ pub fn smoke_test(
     let capture = last_frame.clone();
     let callbacks = Callbacks::new(
         Box::new(move |data, width, height, pitch, format| {
-            let mut guard = capture.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+            let mut guard = capture
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
             *guard = Some(VideoFrame {
                 width,
                 height,
