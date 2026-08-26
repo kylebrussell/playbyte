@@ -106,11 +106,11 @@ fn build_cores() -> Result<()> {
                 // var (so `platform=win` would actually break it - nall
                 // expects `windows`). Instead: build in library mode so the
                 // standalone-application link libraries are omitted. Also
-                // bump nall's Windows guard to Win8.1 (see
-                // ensure_bsnes_win32_winnt).
+                // stop nall's Windows guard from clobbering
+                // __MSVCRT_VERSION__ (see ensure_bsnes_msvcrt_default).
                 "bsnes" => {
                     cmd.arg("binary=library");
-                    ensure_bsnes_win32_winnt()?;
+                    ensure_bsnes_msvcrt_default()?;
                 }
                 _ => {}
             }
@@ -226,35 +226,38 @@ fn ensure_bsnes_stdexcept() -> Result<()> {
     Ok(())
 }
 
-/// Pin _WIN32_WINNT for bsnes on Windows.
+/// Stop bsnes's nall Windows guard from clobbering __MSVCRT_VERSION__.
 ///
-/// mingw-w64 defaults to an XP-era _WIN32_WINNT when it is undefined, hiding
-/// quick_exit/timespec_get from the C++ standard headers under newer GCC.
-/// Done by patching the vendored GNUmakefile rather than a `compiler=` make
-/// argument: arguments containing spaces are split by MSYS make's argument
-/// parsing, silently dropping the flag. Idempotent; skips other platforms.
-/// Bump nall's Windows guard to Win8.1 for bsnes on Windows.
-///
-/// nall/windows/guard.hpp `#undef`s any command-line `_WIN32_WINNT` and pins
-/// WINVER to 0x0601 (Win7). MSYS2/mingw-w64 UCRT toolchains (the GitHub
-/// runner's mingw64 GCC 15) default to 0x0603 and their C standard headers
-/// only declare quick_exit/at_quick_exit/timespec_get at that level, so the
-/// guard's Win7 pin makes libstdc++'s <cstdlib> fail to compile. Patching the
-/// guard to 0x0603 (matching the toolchain default) fixes this; a compiler
-/// `-D` cannot work because the guard undefines it. Idempotent; Windows only.
-fn ensure_bsnes_win32_winnt() -> Result<()> {
+/// nall/windows/guard.hpp pins `__MSVCRT_VERSION__` to WINVER (0x0601) before
+/// any Windows header is included. _mingw.h later derives `_UCRT` from
+/// __MSVCRT_VERSION__ (>= 0x1400 or 0xE00) and mingw-w64's stdlib.h only
+/// declares quick_exit/at_quick_exit when _UCRT is defined - so the guard's
+/// low pin makes libstdc++'s <cstdlib> fail to compile on UCRT toolchains
+/// (the GitHub runner's mingw64 GCC 15), no matter what _WIN32_WINNT is set
+/// to. Removing the pin lets the toolchain default apply. Idempotent;
+/// Windows only.
+fn ensure_bsnes_msvcrt_default() -> Result<()> {
     if !cfg!(target_os = "windows") {
         return Ok(());
     }
     let path = Path::new("vendor/libretro-cores/bsnes/nall/windows/guard.hpp");
     let content =
         fs::read_to_string(path).with_context(|| format!("failed to read {}", path.display()))?;
-    let anchor = "#define WINVER 0x0601";
-    if !content.contains(anchor) {
+    let pin = "#define __MSVCRT_VERSION__ WINVER";
+    if !content.contains(pin) {
         return Ok(());
     }
-    let patched = content.replace(anchor, "#define WINVER 0x0603");
-    println!("Patching {} to pin WINVER 0x0603 ...", path.display());
+    let mut patched = content
+        .replace("#undef __MSVCRT_VERSION__\n", "")
+        .replace(pin, "// __MSVCRT_VERSION__ left to the toolchain default");
+    // Tidy any blank lines left behind by the removal.
+    while patched.contains("\n\n\n") {
+        patched = patched.replace("\n\n\n", "\n\n");
+    }
+    println!(
+        "Patching {} to use toolchain __MSVCRT_VERSION__ ...",
+        path.display()
+    );
     fs::write(path, patched).with_context(|| format!("failed to patch {}", path.display()))?;
     Ok(())
 }
