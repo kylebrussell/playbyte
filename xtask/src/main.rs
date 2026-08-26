@@ -87,7 +87,49 @@ fn build_cores() -> Result<()> {
 
         // Add any core-specific make arguments
         for arg in core.make_args {
+            // mgba's HAVE_LOCALE define requires a POSIX-ish locale_t, which
+            // mingw-w64 does not provide (mgba-util/formatting.h would fail
+            // with "unknown type name 'locale_t'"). Linux and macOS have it.
+            if *arg == "PLATFORM_DEFINES=-DHAVE_LOCALE" && cfg!(target_os = "windows") {
+                continue;
+            }
             cmd.arg(*arg);
+        }
+
+        // Platform-specific workarounds for vendored core Makefiles.
+        if cfg!(target_os = "windows") {
+            match core.id {
+                // mesen/gambatte/mgba detect the platform via `uname -s` and
+                // match `MINGW` or lowercase `win`; MSYS-based Windows
+                // runners report `MSYS_NT-...`, which matches neither, so
+                // they fall through to the unix target and produce a `.so`.
+                // Passing `platform=win` selects the mingw-compatible
+                // gcc/g++ branch that produces a `.dll`.
+                "mesen" | "gambatte" | "mgba" => {
+                    cmd.arg("platform=win");
+                }
+                // bsnes's nall build system detects Windows via the OS env
+                // var (so `platform=win` would actually break it - nall
+                // expects `windows`). Instead: build in library mode so the
+                // standalone-application link libraries are omitted. Also
+                // stop nall's Windows guard from clobbering
+                // __MSVCRT_VERSION__ (see ensure_bsnes_msvcrt_default).
+                "bsnes" => {
+                    cmd.arg("binary=library");
+                    ensure_bsnes_msvcrt_default()?;
+                }
+                _ => {}
+            }
+        } else if cfg!(target_os = "linux") && core.id == "bsnes" {
+            // Build in library mode: the GNUmakefile evaluates `binary :=
+            // application` (its default) before target-libretro switches to
+            // library mode, leaking `-lX11 -lXext` into the core's link line,
+            // which fails on headless CI runners without X11 dev libraries.
+            cmd.arg("binary=library");
+        }
+
+        if core.id == "bsnes" {
+            ensure_bsnes_stdexcept()?;
         }
 
         println!("Building {} in {} ...", core.id, build_dir.display());
@@ -163,6 +205,66 @@ fn package() -> Result<()> {
     fs::copy("README.md", package_dir.join("README.md"))?;
 
     println!("Packaged app at {}", package_dir.display());
+    Ok(())
+}
+
+/// Ensure bsnes's bundled nall headers can find std::runtime_error.
+///
+/// nall/arithmetic/natural.hpp uses std::runtime_error without including
+/// <stdexcept>; newer GCC no longer provides it transitively. Patching the
+/// header directly (idempotently) is more robust than a `compiler=` make
+/// override, which would also apply to C sources where `g++ -x c` cannot
+/// find C++ headers. Mutates the vendored submodule working tree only;
+/// macOS is skipped because it builds cleanly unpatched.
+fn ensure_bsnes_stdexcept() -> Result<()> {
+    if cfg!(target_os = "macos") {
+        return Ok(());
+    }
+    let path = Path::new("vendor/libretro-cores/bsnes/nall/arithmetic/natural.hpp");
+    let content =
+        fs::read_to_string(path).with_context(|| format!("failed to read {}", path.display()))?;
+    if content.contains("#include <stdexcept>") {
+        return Ok(());
+    }
+    println!("Patching {} to include <stdexcept> ...", path.display());
+    fs::write(path, format!("#include <stdexcept>\n{content}"))
+        .with_context(|| format!("failed to patch {}", path.display()))?;
+    Ok(())
+}
+
+/// Stop bsnes's nall Windows guard from clobbering __MSVCRT_VERSION__.
+///
+/// nall/windows/guard.hpp pins `__MSVCRT_VERSION__` to WINVER (0x0601) before
+/// any Windows header is included. _mingw.h later derives `_UCRT` from
+/// __MSVCRT_VERSION__ (>= 0x1400 or 0xE00) and mingw-w64's stdlib.h only
+/// declares quick_exit/at_quick_exit when _UCRT is defined - so the guard's
+/// low pin makes libstdc++'s <cstdlib> fail to compile on UCRT toolchains
+/// (the GitHub runner's mingw64 GCC 15), no matter what _WIN32_WINNT is set
+/// to. Removing the pin lets the toolchain default apply. Idempotent;
+/// Windows only.
+fn ensure_bsnes_msvcrt_default() -> Result<()> {
+    if !cfg!(target_os = "windows") {
+        return Ok(());
+    }
+    let path = Path::new("vendor/libretro-cores/bsnes/nall/windows/guard.hpp");
+    let content =
+        fs::read_to_string(path).with_context(|| format!("failed to read {}", path.display()))?;
+    let pin = "#define __MSVCRT_VERSION__ WINVER";
+    if !content.contains(pin) {
+        return Ok(());
+    }
+    let mut patched = content
+        .replace("#undef __MSVCRT_VERSION__\n", "")
+        .replace(pin, "// __MSVCRT_VERSION__ left to the toolchain default");
+    // Tidy any blank lines left behind by the removal.
+    while patched.contains("\n\n\n") {
+        patched = patched.replace("\n\n\n", "\n\n");
+    }
+    println!(
+        "Patching {} to use toolchain __MSVCRT_VERSION__ ...",
+        path.display()
+    );
+    fs::write(path, patched).with_context(|| format!("failed to patch {}", path.display()))?;
     Ok(())
 }
 
