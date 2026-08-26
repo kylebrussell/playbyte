@@ -105,11 +105,9 @@ fn build_cores() -> Result<()> {
                 // bsnes's nall build system detects Windows via the OS env
                 // var (so `platform=win` would actually break it - nall
                 // expects `windows`). Instead: build in library mode so the
-                // standalone-application link libraries are omitted, and pin
-                // _WIN32_WINNT via the compiler override - mingw-w64 defaults
-                // to the XP-era value when it is undefined, hiding
-                // quick_exit/timespec_get from C++ standard headers under
-                // newer GCC.
+                // standalone-application link libraries are omitted. Also
+                // bump nall's Windows guard to Win8.1 (see
+                // ensure_bsnes_win32_winnt).
                 "bsnes" => {
                     cmd.arg("binary=library");
                     ensure_bsnes_win32_winnt()?;
@@ -235,31 +233,28 @@ fn ensure_bsnes_stdexcept() -> Result<()> {
 /// Done by patching the vendored GNUmakefile rather than a `compiler=` make
 /// argument: arguments containing spaces are split by MSYS make's argument
 /// parsing, silently dropping the flag. Idempotent; skips other platforms.
+/// Bump nall's Windows guard to Win8.1 for bsnes on Windows.
+///
+/// nall/windows/guard.hpp `#undef`s any command-line `_WIN32_WINNT` and pins
+/// WINVER to 0x0601 (Win7). MSYS2/mingw-w64 UCRT toolchains (the GitHub
+/// runner's mingw64 GCC 15) default to 0x0603 and their C standard headers
+/// only declare quick_exit/at_quick_exit/timespec_get at that level, so the
+/// guard's Win7 pin makes libstdc++'s <cstdlib> fail to compile. Patching the
+/// guard to 0x0603 (matching the toolchain default) fixes this; a compiler
+/// `-D` cannot work because the guard undefines it. Idempotent; Windows only.
 fn ensure_bsnes_win32_winnt() -> Result<()> {
     if !cfg!(target_os = "windows") {
         return Ok(());
     }
-    let path = Path::new("vendor/libretro-cores/bsnes/bsnes/GNUmakefile");
+    let path = Path::new("vendor/libretro-cores/bsnes/nall/windows/guard.hpp");
     let content =
         fs::read_to_string(path).with_context(|| format!("failed to read {}", path.display()))?;
-    if content.contains("_WIN32_WINNT") {
+    let anchor = "#define WINVER 0x0601";
+    if !content.contains(anchor) {
         return Ok(());
     }
-    let anchor = "flags += -I. -I..";
-    let Some(line_start) = content.find(anchor) else {
-        bail!("could not find flags anchor in {}", path.display());
-    };
-    // Extend the anchor line itself so the define lands in the same
-    // recursively-expanded `flags` variable used for both C and C++.
-    let newline = content[line_start..]
-        .find('\n')
-        .map(|idx| line_start + idx)
-        .unwrap_or(content.len());
-    let mut patched = String::with_capacity(content.len() + 32);
-    patched.push_str(&content[..newline]);
-    patched.push_str(" -D_WIN32_WINNT=0x0603");
-    patched.push_str(&content[newline..]);
-    println!("Patching {} to pin _WIN32_WINNT ...", path.display());
+    let patched = content.replace(anchor, "#define WINVER 0x0603");
+    println!("Patching {} to pin WINVER 0x0603 ...", path.display());
     fs::write(path, patched).with_context(|| format!("failed to patch {}", path.display()))?;
     Ok(())
 }
