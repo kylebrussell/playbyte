@@ -112,7 +112,7 @@ fn build_cores() -> Result<()> {
                 // newer GCC.
                 "bsnes" => {
                     cmd.arg("binary=library");
-                    cmd.arg("compiler=g++ -D_WIN32_WINNT=0x0603");
+                    ensure_bsnes_win32_winnt()?;
                 }
                 _ => {}
             }
@@ -225,6 +225,42 @@ fn ensure_bsnes_stdexcept() -> Result<()> {
     println!("Patching {} to include <stdexcept> ...", path.display());
     fs::write(path, format!("#include <stdexcept>\n{content}"))
         .with_context(|| format!("failed to patch {}", path.display()))?;
+    Ok(())
+}
+
+/// Pin _WIN32_WINNT for bsnes on Windows.
+///
+/// mingw-w64 defaults to an XP-era _WIN32_WINNT when it is undefined, hiding
+/// quick_exit/timespec_get from the C++ standard headers under newer GCC.
+/// Done by patching the vendored GNUmakefile rather than a `compiler=` make
+/// argument: arguments containing spaces are split by MSYS make's argument
+/// parsing, silently dropping the flag. Idempotent; skips other platforms.
+fn ensure_bsnes_win32_winnt() -> Result<()> {
+    if !cfg!(target_os = "windows") {
+        return Ok(());
+    }
+    let path = Path::new("vendor/libretro-cores/bsnes/bsnes/GNUmakefile");
+    let content =
+        fs::read_to_string(path).with_context(|| format!("failed to read {}", path.display()))?;
+    if content.contains("_WIN32_WINNT") {
+        return Ok(());
+    }
+    let anchor = "flags += -I. -I..";
+    let Some(line_start) = content.find(anchor) else {
+        bail!("could not find flags anchor in {}", path.display());
+    };
+    // Extend the anchor line itself so the define lands in the same
+    // recursively-expanded `flags` variable used for both C and C++.
+    let newline = content[line_start..]
+        .find('\n')
+        .map(|idx| line_start + idx)
+        .unwrap_or(content.len());
+    let mut patched = String::with_capacity(content.len() + 32);
+    patched.push_str(&content[..newline]);
+    patched.push_str(" -D_WIN32_WINNT=0x0603");
+    patched.push_str(&content[newline..]);
+    println!("Patching {} to pin _WIN32_WINNT ...", path.display());
+    fs::write(path, patched).with_context(|| format!("failed to patch {}", path.display()))?;
     Ok(())
 }
 
