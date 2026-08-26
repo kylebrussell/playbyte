@@ -1577,18 +1577,14 @@ fn fs_main(in: VertexOut) -> @location(0) vec4<f32> {
             FeedItem::Byte(mut byte) => {
                 byte.title = trimmed.to_string();
                 if let Err(err) = store.update_metadata(&byte) {
-                    let message = format!("Rename failed: {err}");
-                    self.feed_error = Some(message.clone());
-                    self.ui.push_toast(ui::ToastKind::Error, message);
+                    self.report_error(format!("Rename failed: {err}"));
                     return;
                 }
                 feed.items[index] = FeedItem::Byte(byte);
             }
             FeedItem::RomFallback(mut fallback) => {
                 if let Err(err) = store.set_rom_title(&fallback.rom_sha1, trimmed) {
-                    let message = format!("Rename failed: {err}");
-                    self.feed_error = Some(message.clone());
-                    self.ui.push_toast(ui::ToastKind::Error, message);
+                    self.report_error(format!("Rename failed: {err}"));
                     return;
                 }
                 fallback.title = if trimmed.is_empty() {
@@ -1615,9 +1611,7 @@ fn fs_main(in: VertexOut) -> @location(0) vec4<f32> {
         let trimmed = title.trim();
         if let FeedItem::RomFallback(mut fallback) = item {
             if let Err(err) = store.set_rom_official_override(&fallback.rom_sha1, Some(trimmed)) {
-                let message = format!("Official game update failed: {err}");
-                self.feed_error = Some(message.clone());
-                self.ui.push_toast(ui::ToastKind::Error, message);
+                self.report_error(format!("Official game update failed: {err}"));
                 return;
             }
             fallback.official_title = if trimmed.is_empty() {
@@ -1644,9 +1638,7 @@ fn fs_main(in: VertexOut) -> @location(0) vec4<f32> {
         let store = feed.store.clone();
         if let FeedItem::RomFallback(mut fallback) = item {
             if let Err(err) = store.set_rom_official_override(&fallback.rom_sha1, None) {
-                let message = format!("Official game update failed: {err}");
-                self.feed_error = Some(message.clone());
-                self.ui.push_toast(ui::ToastKind::Error, message);
+                self.report_error(format!("Official game update failed: {err}"));
                 return;
             }
             fallback.official_title = None;
@@ -1696,30 +1688,31 @@ fn fs_main(in: VertexOut) -> @location(0) vec4<f32> {
         }
     }
 
-    fn navigate_feed(&mut self, delta: i32) {
-        let (leaving_key, changed) = {
-            let Some(feed) = self.feed.as_mut() else {
-                return;
-            };
-            let leaving_key = feed.current().map(FeedItem::session_autosave_key);
-            let previous_index = feed.current_index;
-            if delta > 0 {
-                feed.next();
-            } else if delta < 0 {
-                feed.prev();
-            } else {
-                feed.current();
-            }
-            let changed = feed.current_index != previous_index;
-            (leaving_key, changed)
-        };
+    /// Set `feed_error` and surface the same message as an error toast.
+    fn report_error(&mut self, message: String) {
+        self.feed_error = Some(message.clone());
+        self.ui.push_toast(ui::ToastKind::Error, message);
+    }
 
-        if !changed {
-            return;
-        }
+    /// Move the selection with `select`, returning the leaving item's autosave
+    /// key and whether the selection actually changed.
+    fn change_selection(
+        &mut self,
+        select: impl FnOnce(&mut FeedController),
+    ) -> Option<(Option<SessionAutosaveKey>, bool)> {
+        let feed = self.feed.as_mut()?;
+        let leaving_key = feed.current().map(FeedItem::session_autosave_key);
+        let previous_index = feed.current_index;
+        select(feed);
+        let changed = feed.current_index != previous_index;
+        Some((leaving_key, changed))
+    }
 
-        self.store_session_autosave(leaving_key);
-
+    /// Drop the current runtime and rebuild it for the newly selected feed
+    /// item, restoring its session autosave and prefetching neighbors.
+    /// Assumes the selection already changed and the leaving item's autosave
+    /// was stored.
+    fn switch_runtime_to_selected(&mut self) {
         // Libretro cores (and our callback wiring) are effectively single-instance.
         // Drop the current runtime BEFORE constructing the next one to avoid
         // shared-global-state cores (e.g. bsnes) corrupting each other during swaps.
@@ -1751,16 +1744,17 @@ fn fs_main(in: VertexOut) -> @location(0) vec4<f32> {
         }
     }
 
-    fn select_feed_index(&mut self, index: usize) {
-        let (leaving_key, changed) = {
-            let Some(feed) = self.feed.as_mut() else {
-                return;
-            };
-            let leaving_key = feed.current().map(FeedItem::session_autosave_key);
-            let previous_index = feed.current_index;
-            feed.select(index);
-            let changed = feed.current_index != previous_index;
-            (leaving_key, changed)
+    fn navigate_feed(&mut self, delta: i32) {
+        let Some((leaving_key, changed)) = self.change_selection(|feed| {
+            if delta > 0 {
+                feed.next();
+            } else if delta < 0 {
+                feed.prev();
+            } else {
+                feed.current();
+            }
+        }) else {
+            return;
         };
 
         if !changed {
@@ -1768,34 +1762,22 @@ fn fs_main(in: VertexOut) -> @location(0) vec4<f32> {
         }
 
         self.store_session_autosave(leaving_key);
+        self.switch_runtime_to_selected();
+    }
 
-        // See note in `navigate_feed`.
-        self.audio_stream = None;
-        self.runtime = None;
-        self.runtime_meta = None;
-
-        let result = {
-            let Some(feed) = self.feed.as_ref() else {
-                return;
-            };
-            feed.build_runtime_for_current()
+    fn select_feed_index(&mut self, index: usize) {
+        let Some((leaving_key, changed)) = self.change_selection(|feed| {
+            feed.select(index);
+        }) else {
+            return;
         };
 
-        match result {
-            Ok(mut load) => {
-                let entering_key = self
-                    .feed
-                    .as_ref()
-                    .and_then(|feed| feed.current().map(FeedItem::session_autosave_key));
-                self.restore_session_autosave(entering_key, &mut load);
-                self.apply_runtime_load(load);
-                self.feed_error = None;
-                if let Some(feed) = self.feed.as_ref() {
-                    feed.prefetch_neighbors();
-                }
-            }
-            Err(err) => self.feed_error = Some(format!("Load feed item failed: {err}")),
+        if !changed {
+            return;
         }
+
+        self.store_session_autosave(leaving_key);
+        self.switch_runtime_to_selected();
     }
 
     fn apply_runtime_load(&mut self, load: RuntimeLoad) {
@@ -1813,49 +1795,35 @@ fn fs_main(in: VertexOut) -> @location(0) vec4<f32> {
         let runtime = match self.runtime.as_ref() {
             Some(runtime) => runtime,
             None => {
-                self.feed_error = Some("No active runtime to capture".to_string());
-                self.ui.push_toast(
-                    ui::ToastKind::Error,
-                    "No active runtime to capture".to_string(),
-                );
+                self.report_error("No active runtime to capture".to_string());
                 return;
             }
         };
         let meta = match self.runtime_meta.as_ref() {
             Some(meta) => meta.clone(),
             None => {
-                self.feed_error = Some("Missing runtime metadata".to_string());
-                self.ui
-                    .push_toast(ui::ToastKind::Error, "Missing runtime metadata".to_string());
+                self.report_error("Missing runtime metadata".to_string());
                 return;
             }
         };
         let frame = match runtime.latest_frame() {
             Some(frame) => frame,
             None => {
-                self.feed_error = Some("No frame available for thumbnail".to_string());
-                self.ui.push_toast(
-                    ui::ToastKind::Error,
-                    "No frame available for thumbnail".to_string(),
-                );
+                self.report_error("No frame available for thumbnail".to_string());
                 return;
             }
         };
         let state = match runtime.serialize() {
             Ok(state) => state,
             Err(err) => {
-                self.feed_error = Some(format!("Serialize failed: {err}"));
-                self.ui
-                    .push_toast(ui::ToastKind::Error, format!("Serialize failed: {err}"));
+                self.report_error(format!("Serialize failed: {err}"));
                 return;
             }
         };
         let thumbnail = match encode_thumbnail(&frame) {
             Ok(png) => png,
             Err(err) => {
-                self.feed_error = Some(format!("Thumbnail failed: {err}"));
-                self.ui
-                    .push_toast(ui::ToastKind::Error, format!("Thumbnail failed: {err}"));
+                self.report_error(format!("Thumbnail failed: {err}"));
                 return;
             }
         };
@@ -1887,9 +1855,7 @@ fn fs_main(in: VertexOut) -> @location(0) vec4<f32> {
         };
 
         if let Err(err) = store.save_byte(&metadata, &state, &thumbnail) {
-            self.feed_error = Some(format!("Save Byte failed: {err}"));
-            self.ui
-                .push_toast(ui::ToastKind::Error, format!("Save Byte failed: {err}"));
+            self.report_error(format!("Save Byte failed: {err}"));
             return;
         }
 
