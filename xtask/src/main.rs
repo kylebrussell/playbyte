@@ -90,6 +90,13 @@ fn build_cores() -> Result<()> {
             cmd.arg(*arg);
         }
 
+        // Platform-specific workarounds for vendored core Makefiles:
+        // these are build-recipe fixes only; they do not affect macOS, which
+        // builds cleanly without them.
+        for arg in platform_specific_make_args(core.id) {
+            cmd.arg(arg);
+        }
+
         println!("Building {} in {} ...", core.id, build_dir.display());
         let status = cmd
             .status()
@@ -164,6 +171,26 @@ fn package() -> Result<()> {
 
     println!("Packaged app at {}", package_dir.display());
     Ok(())
+}
+
+/// Extra make arguments required to build vendored cores on non-macOS CI:
+///
+/// - Windows: mesen's Makefile auto-detects the platform via `uname -a`, but
+///   MSYS-based runners report `MSYS_NT-...`, which matches neither `MINGW`
+///   nor `win`, so it falls through to the unix target and produces a `.so`.
+///   Passing `platform=win` selects the mingw-compatible gcc/g++ branch.
+/// - Linux/Windows: bsnes's bundled nall headers use `std::runtime_error`
+///   without including `<stdexcept>`; newer GCC (and mingw g++) no longer
+///   provide it transitively, so force-include the header via the compiler
+///   override that nall's build system supports.
+fn platform_specific_make_args(core_id: &str) -> &'static [&'static str] {
+    match core_id {
+        "mesen" if cfg!(target_os = "windows") => &["platform=win"],
+        "bsnes" if cfg!(any(target_os = "windows", target_os = "linux")) => {
+            &["compiler=g++ -include stdexcept"]
+        }
+        _ => &[],
+    }
 }
 
 fn core_extension() -> &'static str {
