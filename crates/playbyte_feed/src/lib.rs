@@ -8,7 +8,10 @@ use std::{
     collections::HashMap,
     fs,
     path::{Path, PathBuf},
-    sync::{Arc, Mutex},
+    sync::{
+        atomic::{AtomicU64, Ordering},
+        Arc, Mutex,
+    },
 };
 use thiserror::Error;
 use walkdir::WalkDir;
@@ -23,6 +26,41 @@ pub enum FeedError {
     Http(#[from] reqwest::Error),
     #[error("missing metadata for byte {0}")]
     MissingMetadata(String),
+}
+
+static WRITE_ATOMIC_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+/// Write `data` to `path` atomically: stage the bytes in a uniquely named temp
+/// file in the same directory, then rename it over the destination. Renaming is
+/// atomic on POSIX (and Windows same-volume), so readers never observe a
+/// partially written file. The temp file is removed if any step fails.
+fn write_atomic(path: &Path, data: &[u8]) -> std::io::Result<()> {
+    let parent = path.parent().unwrap_or_else(|| Path::new("."));
+    let file_name = path
+        .file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "file".to_string());
+    let temp_path = loop {
+        let serial = WRITE_ATOMIC_COUNTER.fetch_add(1, Ordering::Relaxed);
+        let candidate = parent.join(format!(
+            ".{file_name}.{}.{}.tmp",
+            std::process::id(),
+            serial
+        ));
+        if !candidate.exists() {
+            break candidate;
+        }
+    };
+
+    if let Err(err) = fs::write(&temp_path, data) {
+        let _ = fs::remove_file(&temp_path);
+        return Err(err);
+    }
+    if let Err(err) = fs::rename(&temp_path, path) {
+        let _ = fs::remove_file(&temp_path);
+        return Err(err);
+    }
+    Ok(())
 }
 
 #[derive(Clone)]
@@ -189,12 +227,15 @@ impl LocalByteStore {
         let state_path = byte_dir.join(&metadata.state_path);
         let thumbnail_path = byte_dir.join(&metadata.thumbnail_path);
 
-        let serialized = serde_json::to_string_pretty(metadata)?;
-        fs::write(metadata_path, serialized)?;
-
+        // Payloads first, metadata LAST: a crash mid-save can only leave files
+        // without a valid-looking byte.json pointing at them, and load_index
+        // skips directories whose byte.json is absent.
         let compressed = zstd::stream::encode_all(state, 3)?;
-        fs::write(state_path, compressed)?;
-        fs::write(thumbnail_path, thumbnail)?;
+        write_atomic(&state_path, &compressed)?;
+        write_atomic(&thumbnail_path, thumbnail)?;
+
+        let serialized = serde_json::to_string_pretty(metadata)?;
+        write_atomic(&metadata_path, serialized.as_bytes())?;
 
         if let Ok(mut guard) = self.index.lock() {
             guard.push(metadata.clone());
@@ -208,7 +249,7 @@ impl LocalByteStore {
         fs::create_dir_all(&byte_dir)?;
         let metadata_path = byte_dir.join("byte.json");
         let serialized = serde_json::to_string_pretty(metadata)?;
-        fs::write(metadata_path, serialized)?;
+        write_atomic(&metadata_path, serialized.as_bytes())?;
 
         if let Ok(mut guard) = self.index.lock() {
             if let Some(entry) = guard
@@ -243,7 +284,7 @@ impl LocalByteStore {
         }
         fs::create_dir_all(&self.root)?;
         let serialized = serde_json::to_string_pretty(&titles)?;
-        fs::write(self.rom_titles_path(), serialized)?;
+        write_atomic(&self.rom_titles_path(), serialized.as_bytes())?;
         Ok(())
     }
 
@@ -270,7 +311,7 @@ impl LocalByteStore {
         }
         fs::create_dir_all(&self.root)?;
         let serialized = serde_json::to_string_pretty(&overrides)?;
-        fs::write(self.rom_official_overrides_path(), serialized)?;
+        write_atomic(&self.rom_official_overrides_path(), serialized.as_bytes())?;
         Ok(())
     }
 
@@ -504,6 +545,79 @@ mod tests {
         let entries = store.load_index().expect("load_index should succeed");
         assert_eq!(entries.len(), 1);
         assert_eq!(entries[0].byte_id, "good-byte");
+
+        fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn write_atomic_creates_overwrites_and_leaves_no_temp_files() {
+        let dir =
+            std::env::temp_dir().join(format!("playbyte_write_atomic_{}", std::process::id()));
+        fs::create_dir_all(&dir).expect("create temp dir");
+        let target = dir.join("out.json");
+
+        write_atomic(&target, b"first").expect("initial write");
+        assert_eq!(fs::read(&target).unwrap(), b"first");
+
+        // Overwriting an existing destination must also be atomic-safe.
+        write_atomic(&target, b"second-payload").expect("overwrite");
+        assert_eq!(fs::read(&target).unwrap(), b"second-payload");
+
+        // No staging files left behind in the directory.
+        let leftovers: Vec<_> = fs::read_dir(&dir)
+            .unwrap()
+            .filter_map(|entry| entry.ok())
+            .map(|entry| entry.file_name().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(leftovers.len(), 1, "only the destination should remain");
+        assert_eq!(leftovers[0], "out.json");
+
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn save_byte_round_trips_through_loaders() {
+        let root =
+            std::env::temp_dir().join(format!("playbyte_save_roundtrip_{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        let store = LocalByteStore::new(&root);
+
+        let metadata = ByteMetadata {
+            byte_id: "round-trip".to_string(),
+            system: System::Nes,
+            core_id: "mesen".to_string(),
+            core_semver: "1.0.0".to_string(),
+            rom_sha1: "abc123".to_string(),
+            region: None,
+            title: "Round Trip".to_string(),
+            description: String::new(),
+            tags: Vec::new(),
+            author: "local".to_string(),
+            created_at: "2026-01-17T00:00:00Z".to_string(),
+            thumbnail_path: "thumbnail.png".to_string(),
+            state_path: "state.zst".to_string(),
+        };
+
+        store
+            .save_byte(&metadata, b"emulator-state-bytes", b"png-thumbnail")
+            .expect("save_byte should succeed");
+
+        // The freshly saved Byte is immediately loadable through every reader.
+        assert_eq!(store.get("round-trip").unwrap().title, "Round Trip");
+        assert_eq!(
+            store.load_state("round-trip").unwrap(),
+            b"emulator-state-bytes"
+        );
+        assert_eq!(
+            store.load_thumbnail("round-trip").unwrap(),
+            b"png-thumbnail"
+        );
+
+        // Metadata is parseable by load_index (happy path of the crash-safety
+        // contract: payloads + valid metadata all present).
+        let indexed = store.load_index().unwrap();
+        assert_eq!(indexed.len(), 1);
+        assert_eq!(indexed[0].byte_id, "round-trip");
 
         fs::remove_dir_all(&root).ok();
     }
