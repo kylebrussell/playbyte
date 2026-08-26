@@ -45,7 +45,7 @@ pub fn library_card(
     } else {
         theme.card
     };
-    let stroke = Stroke::new(1.0, theme.card_border);
+    let stroke = Stroke::new(1.0_f32, theme.card_border);
     let rounding = Rounding::same(18.0);
     let shadow_rect = draw_rect.translate(Vec2::new(0.0, 8.0));
     ui.painter()
@@ -55,7 +55,7 @@ pub fn library_card(
 
     if selected {
         ui.painter()
-            .rect_stroke(draw_rect, rounding, Stroke::new(1.5, theme.accent));
+            .rect_stroke(draw_rect, rounding, Stroke::new(1.5_f32, theme.accent));
     }
 
     let image_rect = draw_rect.shrink(10.0);
