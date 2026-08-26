@@ -90,11 +90,18 @@ fn build_cores() -> Result<()> {
             cmd.arg(*arg);
         }
 
-        // Platform-specific workarounds for vendored core Makefiles:
-        // these are build-recipe fixes only; they do not affect macOS, which
-        // builds cleanly without them.
-        for arg in platform_specific_make_args(core.id) {
-            cmd.arg(arg);
+        // Platform-specific workaround: mesen's Makefile auto-detects the
+        // platform via `uname -a`, but MSYS-based Windows runners report
+        // `MSYS_NT-...` which matches neither `MINGW` nor `win`, so it falls
+        // through to the unix target and produces a `.so`. Passing
+        // `platform=win` explicitly selects the mingw-compatible gcc/g++
+        // branch that produces a `.dll`.
+        if cfg!(target_os = "windows") && core.id == "mesen" {
+            cmd.arg("platform=win");
+        }
+
+        if core.id == "bsnes" {
+            ensure_bsnes_stdexcept()?;
         }
 
         println!("Building {} in {} ...", core.id, build_dir.display());
@@ -173,24 +180,28 @@ fn package() -> Result<()> {
     Ok(())
 }
 
-/// Extra make arguments required to build vendored cores on non-macOS CI:
+/// Ensure bsnes's bundled nall headers can find std::runtime_error.
 ///
-/// - Windows: mesen's Makefile auto-detects the platform via `uname -a`, but
-///   MSYS-based runners report `MSYS_NT-...`, which matches neither `MINGW`
-///   nor `win`, so it falls through to the unix target and produces a `.so`.
-///   Passing `platform=win` selects the mingw-compatible gcc/g++ branch.
-/// - Linux/Windows: bsnes's bundled nall headers use `std::runtime_error`
-///   without including `<stdexcept>`; newer GCC (and mingw g++) no longer
-///   provide it transitively, so force-include the header via the compiler
-///   override that nall's build system supports.
-fn platform_specific_make_args(core_id: &str) -> &'static [&'static str] {
-    match core_id {
-        "mesen" if cfg!(target_os = "windows") => &["platform=win"],
-        "bsnes" if cfg!(any(target_os = "windows", target_os = "linux")) => {
-            &["compiler=g++ -include stdexcept"]
-        }
-        _ => &[],
+/// nall/arithmetic/natural.hpp uses std::runtime_error without including
+/// <stdexcept>; newer GCC no longer provides it transitively. Patching the
+/// header directly (idempotently) is more robust than a `compiler=` make
+/// override, which would also apply to C sources where `g++ -x c` cannot
+/// find C++ headers. Mutates the vendored submodule working tree only;
+/// macOS is skipped because it builds cleanly unpatched.
+fn ensure_bsnes_stdexcept() -> Result<()> {
+    if cfg!(target_os = "macos") {
+        return Ok(());
     }
+    let path = Path::new("vendor/libretro-cores/bsnes/nall/arithmetic/natural.hpp");
+    let content =
+        fs::read_to_string(path).with_context(|| format!("failed to read {}", path.display()))?;
+    if content.contains("#include <stdexcept>") {
+        return Ok(());
+    }
+    println!("Patching {} to include <stdexcept> ...", path.display());
+    fs::write(path, format!("#include <stdexcept>\n{content}"))
+        .with_context(|| format!("failed to patch {}", path.display()))?;
+    Ok(())
 }
 
 fn core_extension() -> &'static str {
