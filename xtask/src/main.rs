@@ -87,6 +87,12 @@ fn build_cores() -> Result<()> {
 
         // Add any core-specific make arguments
         for arg in core.make_args {
+            // mgba's HAVE_LOCALE define requires a POSIX-ish locale_t, which
+            // mingw-w64 does not provide (mgba-util/formatting.h would fail
+            // with "unknown type name 'locale_t'"). Linux and macOS have it.
+            if *arg == "PLATFORM_DEFINES=-DHAVE_LOCALE" && cfg!(target_os = "windows") {
+                continue;
+            }
             cmd.arg(*arg);
         }
 
