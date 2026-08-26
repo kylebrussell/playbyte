@@ -8,10 +8,7 @@ use std::{
     collections::HashMap,
     fs,
     path::{Path, PathBuf},
-    sync::{
-        atomic::{AtomicU64, Ordering},
-        Arc, Mutex,
-    },
+    sync::{Arc, Mutex},
 };
 use thiserror::Error;
 use walkdir::WalkDir;
@@ -30,39 +27,30 @@ pub enum FeedError {
     MissingMetadata(String),
 }
 
-static WRITE_ATOMIC_COUNTER: AtomicU64 = AtomicU64::new(0);
-
 /// Write `data` to `path` atomically: stage the bytes in a uniquely named temp
-/// file in the same directory, then rename it over the destination. Renaming is
-/// atomic on POSIX (and Windows same-volume), so readers never observe a
-/// partially written file. The temp file is removed if any step fails.
+/// file in the same directory, then persist it over the destination. The
+/// replace is atomic on POSIX (rename) and Windows (MoveFileEx with
+/// REPLACE_EXISTING via tempfile's `persist`), so readers never observe a
+/// partially written file. Staged files are removed if any step fails.
 fn write_atomic(path: &Path, data: &[u8]) -> std::io::Result<()> {
     let parent = path.parent().unwrap_or_else(|| Path::new("."));
     let file_name = path
         .file_name()
         .map(|name| name.to_string_lossy().into_owned())
         .unwrap_or_else(|| "file".to_string());
-    let temp_path = loop {
-        let serial = WRITE_ATOMIC_COUNTER.fetch_add(1, Ordering::Relaxed);
-        let candidate = parent.join(format!(
-            ".{file_name}.{}.{}.tmp",
-            std::process::id(),
-            serial
-        ));
-        if !candidate.exists() {
-            break candidate;
-        }
-    };
 
-    if let Err(err) = fs::write(&temp_path, data) {
-        let _ = fs::remove_file(&temp_path);
-        return Err(err);
-    }
-    if let Err(err) = fs::rename(&temp_path, path) {
-        let _ = fs::remove_file(&temp_path);
-        return Err(err);
-    }
-    Ok(())
+    let mut temp = tempfile::Builder::new()
+        .prefix(&format!(".{file_name}."))
+        .suffix(".tmp")
+        .rand_bytes(8)
+        .tempfile_in(parent)?;
+    use std::io::Write as _;
+    temp.as_file_mut().write_all(data)?; // NamedTempFile deletes on drop on error paths
+
+    // `persist` atomically replaces the destination, including on Windows
+    // (MoveFileEx with REPLACE_EXISTING). On persist failure the staged file is
+    // dropped along with the PersistError, cleaning itself up.
+    temp.persist(path).map(|_| ()).map_err(|err| err.error)
 }
 
 #[derive(Clone)]
