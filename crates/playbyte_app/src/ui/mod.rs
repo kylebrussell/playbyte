@@ -185,16 +185,14 @@ impl UiState {
         fallback: &crate::RomFallback,
         store: &playbyte_feed::LocalByteStore,
     ) {
-        let titles = store
-            .list_romdb_titles(fallback.system.clone())
-            .unwrap_or_default();
+        let titles = store.list_romdb_titles(fallback.system).unwrap_or_default();
         let normalized_titles = titles
             .iter()
             .map(|title| normalize_picker_query(title))
             .collect();
         self.official_picker = Some(OfficialPickerState {
             index,
-            system: fallback.system.clone(),
+            system: fallback.system,
             titles,
             normalized_titles,
             query: String::new(),
@@ -225,8 +223,7 @@ impl UiState {
                     ui.add_space(12.0);
                     if let Some(fps) = data.frame_stats.avg_fps() {
                         ui.label(
-                            egui::RichText::new(format!("{fps:.0} fps"))
-                                .color(self.theme.text_dim),
+                            egui::RichText::new(format!("{fps:.0} fps")).color(self.theme.text_dim),
                         );
                     }
                     if let Some(runtime) = &data.runtime {
@@ -243,11 +240,11 @@ impl UiState {
                     }
 
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        if data.runtime.is_some() {
-                            if primary_button(ui, "Save to Play Later", &self.theme).clicked() {
-                                actions.push(Action::CreateByte);
-                                self.record_interaction();
-                            }
+                        if data.runtime.is_some()
+                            && primary_button(ui, "Save to Play Later", &self.theme).clicked()
+                        {
+                            actions.push(Action::CreateByte);
+                            self.record_interaction();
                         }
                     });
                 });
@@ -336,10 +333,20 @@ impl UiState {
                                         System::Gbc => "GBC",
                                         System::Gba => "GBA",
                                     };
-                                    badge(ui, system_label, self.theme.accent_soft, self.theme.text);
+                                    badge(
+                                        ui,
+                                        system_label,
+                                        self.theme.accent_soft,
+                                        self.theme.text,
+                                    );
                                     if let crate::FeedItem::Byte(byte) = current {
                                         for tag in byte.tags.iter().take(3) {
-                                            badge(ui, tag, self.theme.panel_alt, self.theme.text_dim);
+                                            badge(
+                                                ui,
+                                                tag,
+                                                self.theme.panel_alt,
+                                                self.theme.text_dim,
+                                            );
                                         }
                                     }
                                 });
@@ -457,14 +464,12 @@ impl UiState {
                                             actions.push(Action::SelectIndex(idx));
                                             self.record_interaction();
                                         }
-                                        if selected {
-                                            if self.last_centered_index != Some(idx) {
-                                                ui.scroll_to_rect(
-                                                    response.rect,
-                                                    Some(egui::Align::Center),
-                                                );
-                                                self.last_centered_index = Some(idx);
-                                            }
+                                        if selected && self.last_centered_index != Some(idx) {
+                                            ui.scroll_to_rect(
+                                                response.rect,
+                                                Some(egui::Align::Center),
+                                            );
+                                            self.last_centered_index = Some(idx);
                                         }
                                     }
                                 });
@@ -571,7 +576,8 @@ impl UiState {
 
     fn render_toasts(&mut self, ctx: &egui::Context, now: Instant) {
         let duration = Duration::from_secs(3);
-        self.toasts.retain(|toast| now.saturating_duration_since(toast.created_at) < duration);
+        self.toasts
+            .retain(|toast| now.saturating_duration_since(toast.created_at) < duration);
         if self.toasts.is_empty() {
             return;
         }
@@ -643,11 +649,16 @@ impl OfficialPickerState {
                 } else if normalized.starts_with(&query) {
                     score = 800;
                 }
-                score -= (normalized.len() as i32 - query.len() as i32).abs().min(200);
+                score -= (normalized.len() as i32 - query.len() as i32)
+                    .abs()
+                    .min(200);
                 matches.push((score, idx));
             }
         }
-        matches.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| self.titles[a.1].cmp(&self.titles[b.1])));
+        matches.sort_by(|a, b| {
+            b.0.cmp(&a.0)
+                .then_with(|| self.titles[a.1].cmp(&self.titles[b.1]))
+        });
         matches
             .into_iter()
             .take(limit)

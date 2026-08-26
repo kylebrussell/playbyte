@@ -126,7 +126,11 @@ impl RomDatabase {
         if !self.normalized_titles.is_empty() {
             return;
         }
-        self.normalized_titles = self.titles.iter().map(|title| normalize_title(title)).collect();
+        self.normalized_titles = self
+            .titles
+            .iter()
+            .map(|title| normalize_title(title))
+            .collect();
         self.normalized_base_titles = self
             .titles
             .iter()
@@ -165,7 +169,10 @@ pub fn system_dat_url(system: System) -> &'static str {
 pub fn sanitize_thumbnail_title(title: &str) -> String {
     let mut output = String::with_capacity(title.len());
     for ch in title.chars() {
-        let needs_replace = matches!(ch, '&' | '*' | '/' | ':' | '`' | '<' | '>' | '?' | '\\' | '|');
+        let needs_replace = matches!(
+            ch,
+            '&' | '*' | '/' | ':' | '`' | '<' | '>' | '?' | '\\' | '|'
+        );
         if needs_replace {
             output.push('_');
         } else {
@@ -181,14 +188,14 @@ pub fn build_thumbnail_url(system: System, title: &str) -> String {
     let filename = format!("{sanitized}.png");
     let folder_segment = percent_encode_path_segment(folder);
     let file_segment = percent_encode_path_segment(&filename);
-    format!(
-        "https://thumbnails.libretro.com/{folder_segment}/Named_Boxarts/{file_segment}"
-    )
+    format!("https://thumbnails.libretro.com/{folder_segment}/Named_Boxarts/{file_segment}")
 }
 
 pub fn cover_path(cache_root: &Path, system: System, title: &str) -> PathBuf {
     let sanitized = sanitize_thumbnail_title(title);
-    cache_root.join(system_id(system)).join(format!("{sanitized}.png"))
+    cache_root
+        .join(system_id(system))
+        .join(format!("{sanitized}.png"))
 }
 
 fn parse_dat<R: BufRead>(reader: R) -> Result<RomDatabase, FeedError> {

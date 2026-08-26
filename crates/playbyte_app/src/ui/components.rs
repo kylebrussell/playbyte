@@ -9,12 +9,7 @@ pub fn badge(ui: &mut egui::Ui, label: &str, fill: Color32, text: Color32) -> Re
         .rounding(Rounding::same(10.0))
         .inner_margin(egui::Margin::symmetric(8.0, 3.0))
         .show(ui, |ui| {
-            ui.label(
-                egui::RichText::new(label)
-                    .color(text)
-                    .size(12.0)
-                    .strong(),
-            )
+            ui.label(egui::RichText::new(label).color(text).size(12.0).strong())
         })
         .response
 }
@@ -39,27 +34,28 @@ pub fn library_card(
     let (rect, response) = ui.allocate_exact_size(size, Sense::click());
     let draw_rect = Rect::from_center_size(
         rect.center(),
-        Vec2::new(size.x * lerp(0.94, 1.02, anim), size.y * lerp(0.94, 1.02, anim)),
+        Vec2::new(
+            size.x * lerp(0.94, 1.02, anim),
+            size.y * lerp(0.94, 1.02, anim),
+        ),
     );
 
-    let fill = if selected { theme.card_selected } else { theme.card };
-    let stroke = Stroke::new(1.0, theme.card_border);
+    let fill = if selected {
+        theme.card_selected
+    } else {
+        theme.card
+    };
+    let stroke = Stroke::new(1.0_f32, theme.card_border);
     let rounding = Rounding::same(18.0);
     let shadow_rect = draw_rect.translate(Vec2::new(0.0, 8.0));
-    ui.painter().rect_filled(
-        shadow_rect,
-        rounding,
-        Color32::from_black_alpha(100),
-    );
+    ui.painter()
+        .rect_filled(shadow_rect, rounding, Color32::from_black_alpha(100));
     ui.painter().rect_filled(draw_rect, rounding, fill);
     ui.painter().rect_stroke(draw_rect, rounding, stroke);
 
     if selected {
-        ui.painter().rect_stroke(
-            draw_rect,
-            rounding,
-            Stroke::new(1.5, theme.accent),
-        );
+        ui.painter()
+            .rect_stroke(draw_rect, rounding, Stroke::new(1.5_f32, theme.accent));
     }
 
     let image_rect = draw_rect.shrink(10.0);
@@ -139,7 +135,9 @@ pub fn toast(ui: &mut egui::Ui, text: &str, fill: Color32, text_color: Color32) 
         .fill(fill)
         .rounding(Rounding::same(14.0))
         .inner_margin(egui::Margin::symmetric(14.0, 10.0))
-        .show(ui, |ui| ui.label(egui::RichText::new(text).color(text_color)));
+        .show(ui, |ui| {
+            ui.label(egui::RichText::new(text).color(text_color))
+        });
 }
 
 pub fn hint_strip(ui: &mut egui::Ui, text: &str, theme: &UiTheme) {
@@ -147,7 +145,9 @@ pub fn hint_strip(ui: &mut egui::Ui, text: &str, theme: &UiTheme) {
         .fill(theme.panel_alt)
         .rounding(Rounding::same(16.0))
         .inner_margin(egui::Margin::symmetric(18.0, 10.0))
-        .show(ui, |ui| ui.label(egui::RichText::new(text).color(theme.text_dim)));
+        .show(ui, |ui| {
+            ui.label(egui::RichText::new(text).color(theme.text_dim))
+        });
 }
 
 fn fit_aspect(image_size: Vec2, bounds: Rect) -> Rect {

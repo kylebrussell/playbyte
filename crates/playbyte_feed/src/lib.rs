@@ -13,6 +13,8 @@ use std::{
 use thiserror::Error;
 use walkdir::WalkDir;
 
+use std::io::{BufRead, BufReader};
+
 #[derive(Error, Debug)]
 pub enum FeedError {
     #[error("io error: {0}")]
@@ -23,6 +25,32 @@ pub enum FeedError {
     Http(#[from] reqwest::Error),
     #[error("missing metadata for byte {0}")]
     MissingMetadata(String),
+}
+
+/// Write `data` to `path` atomically: stage the bytes in a uniquely named temp
+/// file in the same directory, then persist it over the destination. The
+/// replace is atomic on POSIX (rename) and Windows (MoveFileEx with
+/// REPLACE_EXISTING via tempfile's `persist`), so readers never observe a
+/// partially written file. Staged files are removed if any step fails.
+fn write_atomic(path: &Path, data: &[u8]) -> std::io::Result<()> {
+    let parent = path.parent().unwrap_or_else(|| Path::new("."));
+    let file_name = path
+        .file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "file".to_string());
+
+    let mut temp = tempfile::Builder::new()
+        .prefix(&format!(".{file_name}."))
+        .suffix(".tmp")
+        .rand_bytes(8)
+        .tempfile_in(parent)?;
+    use std::io::Write as _;
+    temp.as_file_mut().write_all(data)?; // NamedTempFile deletes on drop on error paths
+
+    // `persist` atomically replaces the destination, including on Windows
+    // (MoveFileEx with REPLACE_EXISTING). On persist failure the staged file is
+    // dropped along with the PersistError, cleaning itself up.
+    temp.persist(path).map(|_| ()).map_err(|err| err.error)
 }
 
 #[derive(Clone)]
@@ -73,17 +101,38 @@ impl LocalByteStore {
 
         let mut entries = Vec::new();
         for entry in fs::read_dir(bytes_root)? {
-            let entry = entry?;
-            if !entry.file_type()?.is_dir() {
+            // A single unreadable directory entry should not fail the whole feed.
+            let Ok(entry) = entry else { continue };
+            let Ok(file_type) = entry.file_type() else {
+                continue;
+            };
+            if !file_type.is_dir() {
                 continue;
             }
-            let byte_dir = entry.path();
-            let byte_json = byte_dir.join("byte.json");
+            let byte_json = entry.path().join("byte.json");
             if !byte_json.exists() {
                 continue;
             }
-            let data = fs::read_to_string(&byte_json)?;
-            let metadata: ByteMetadata = serde_json::from_str(&data)?;
+            let data = match fs::read_to_string(&byte_json) {
+                Ok(data) => data,
+                Err(err) => {
+                    eprintln!(
+                        "playbyte_feed: skipping unreadable {}: {err}",
+                        byte_json.display()
+                    );
+                    continue;
+                }
+            };
+            let metadata: ByteMetadata = match serde_json::from_str(&data) {
+                Ok(metadata) => metadata,
+                Err(err) => {
+                    eprintln!(
+                        "playbyte_feed: skipping malformed {}: {err}",
+                        byte_json.display()
+                    );
+                    continue;
+                }
+            };
             entries.push(metadata);
         }
 
@@ -168,12 +217,15 @@ impl LocalByteStore {
         let state_path = byte_dir.join(&metadata.state_path);
         let thumbnail_path = byte_dir.join(&metadata.thumbnail_path);
 
-        let serialized = serde_json::to_string_pretty(metadata)?;
-        fs::write(metadata_path, serialized)?;
-
+        // Payloads first, metadata LAST: a crash mid-save can only leave files
+        // without a valid-looking byte.json pointing at them, and load_index
+        // skips directories whose byte.json is absent.
         let compressed = zstd::stream::encode_all(state, 3)?;
-        fs::write(state_path, compressed)?;
-        fs::write(thumbnail_path, thumbnail)?;
+        write_atomic(&state_path, &compressed)?;
+        write_atomic(&thumbnail_path, thumbnail)?;
+
+        let serialized = serde_json::to_string_pretty(metadata)?;
+        write_atomic(&metadata_path, serialized.as_bytes())?;
 
         if let Ok(mut guard) = self.index.lock() {
             guard.push(metadata.clone());
@@ -187,10 +239,13 @@ impl LocalByteStore {
         fs::create_dir_all(&byte_dir)?;
         let metadata_path = byte_dir.join("byte.json");
         let serialized = serde_json::to_string_pretty(metadata)?;
-        fs::write(metadata_path, serialized)?;
+        write_atomic(&metadata_path, serialized.as_bytes())?;
 
         if let Ok(mut guard) = self.index.lock() {
-            if let Some(entry) = guard.iter_mut().find(|entry| entry.byte_id == metadata.byte_id) {
+            if let Some(entry) = guard
+                .iter_mut()
+                .find(|entry| entry.byte_id == metadata.byte_id)
+            {
                 *entry = metadata.clone();
             } else {
                 guard.push(metadata.clone());
@@ -219,7 +274,7 @@ impl LocalByteStore {
         }
         fs::create_dir_all(&self.root)?;
         let serialized = serde_json::to_string_pretty(&titles)?;
-        fs::write(self.rom_titles_path(), serialized)?;
+        write_atomic(&self.rom_titles_path(), serialized.as_bytes())?;
         Ok(())
     }
 
@@ -246,7 +301,7 @@ impl LocalByteStore {
         }
         fs::create_dir_all(&self.root)?;
         let serialized = serde_json::to_string_pretty(&overrides)?;
-        fs::write(self.rom_official_overrides_path(), serialized)?;
+        write_atomic(&self.rom_official_overrides_path(), serialized.as_bytes())?;
         Ok(())
     }
 
@@ -431,9 +486,177 @@ fn is_rom_file(path: &Path) -> bool {
     )
 }
 
-fn hash_file(path: &Path) -> Result<String, FeedError> {
-    let data = fs::read(path)?;
+/// Stream `path` through SHA-1 without ever holding the whole file in memory.
+/// Returns the digest as lowercase hex.
+pub fn sha1_hex_of_file(path: &Path) -> Result<String, FeedError> {
     let mut hasher = Sha1::new();
-    hasher.update(data);
+    let mut reader = BufReader::with_capacity(64 * 1024, fs::File::open(path)?);
+    loop {
+        let chunk = reader.fill_buf()?;
+        if chunk.is_empty() {
+            break;
+        }
+        hasher.update(chunk);
+        let len = chunk.len();
+        reader.consume(len);
+    }
     Ok(format!("{:x}", hasher.finalize()))
+}
+
+fn hash_file(path: &Path) -> Result<String, FeedError> {
+    sha1_hex_of_file(path)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn write_byte(root: &Path, byte_id: &str, contents: &str) {
+        let dir = root.join("bytes").join(byte_id);
+        fs::create_dir_all(&dir).expect("create byte dir");
+        fs::write(dir.join("byte.json"), contents).expect("write byte.json");
+    }
+
+    #[test]
+    fn load_index_skips_corrupt_entries() {
+        let root = std::env::temp_dir().join(format!("playbyte_feed_test_{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        let store = LocalByteStore::new(&root);
+
+        write_byte(
+            &root,
+            "good-byte",
+            r#"{
+                "byte_id": "good-byte",
+                "system": "nes",
+                "core_id": "mesen",
+                "core_semver": "1.0.0",
+                "rom_sha1": "abc123",
+                "region": null,
+                "title": "Good Byte",
+                "description": "",
+                "tags": [],
+                "author": "local",
+                "created_at": "2026-01-17T00:00:00Z",
+                "thumbnail_path": "thumbnail.png",
+                "state_path": "state.zst"
+            }"#,
+        );
+        write_byte(&root, "bad-json", "{ not valid json");
+        // Missing required fields.
+        write_byte(&root, "missing-fields", r#"{"byte_id": "missing-fields"}"#);
+
+        let entries = store.load_index().expect("load_index should succeed");
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].byte_id, "good-byte");
+
+        fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn sha1_hex_of_file_matches_known_vectors() {
+        let dir = std::env::temp_dir().join(format!("playbyte_sha1_stream_{}", std::process::id()));
+        fs::create_dir_all(&dir).expect("create temp dir");
+
+        // Empty file: well-known SHA-1 vector.
+        let empty = dir.join("empty.bin");
+        fs::write(&empty, b"").expect("create empty file");
+        assert_eq!(
+            sha1_hex_of_file(&empty).expect("hash empty file"),
+            "da39a3ee5e6b4b0d3255bfef95601890afd80709"
+        );
+
+        // "abc": standard NIST SHA-1 test vector.
+        let abc = dir.join("abc.bin");
+        fs::write(&abc, b"abc").expect("write abc");
+        assert_eq!(
+            sha1_hex_of_file(&abc).expect("hash abc"),
+            "a9993e364706816aba3e25717850c26c9cd0d89d"
+        );
+
+        // Multi-chunk input (larger than the 64 KiB reader capacity) must hash
+        // identically to a whole-file read would.
+        let big = dir.join("big.bin");
+        let payload: Vec<u8> = (0..200_000u32).map(|i| (i % 251) as u8).collect();
+        fs::write(&big, &payload).expect("write payload");
+        let mut expected = Sha1::new();
+        expected.update(&payload);
+        let expected_hex = format!("{:x}", expected.finalize());
+        assert_eq!(sha1_hex_of_file(&big).expect("hash payload"), expected_hex);
+
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn write_atomic_creates_overwrites_and_leaves_no_temp_files() {
+        let dir =
+            std::env::temp_dir().join(format!("playbyte_write_atomic_{}", std::process::id()));
+        fs::create_dir_all(&dir).expect("create temp dir");
+        let target = dir.join("out.json");
+
+        write_atomic(&target, b"first").expect("initial write");
+        assert_eq!(fs::read(&target).unwrap(), b"first");
+
+        // Overwriting an existing destination must also be atomic-safe.
+        write_atomic(&target, b"second-payload").expect("overwrite");
+        assert_eq!(fs::read(&target).unwrap(), b"second-payload");
+
+        // No staging files left behind in the directory.
+        let leftovers: Vec<_> = fs::read_dir(&dir)
+            .unwrap()
+            .filter_map(|entry| entry.ok())
+            .map(|entry| entry.file_name().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(leftovers.len(), 1, "only the destination should remain");
+        assert_eq!(leftovers[0], "out.json");
+
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn save_byte_round_trips_through_loaders() {
+        let root =
+            std::env::temp_dir().join(format!("playbyte_save_roundtrip_{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        let store = LocalByteStore::new(&root);
+
+        let metadata = ByteMetadata {
+            byte_id: "round-trip".to_string(),
+            system: System::Nes,
+            core_id: "mesen".to_string(),
+            core_semver: "1.0.0".to_string(),
+            rom_sha1: "abc123".to_string(),
+            region: None,
+            title: "Round Trip".to_string(),
+            description: String::new(),
+            tags: Vec::new(),
+            author: "local".to_string(),
+            created_at: "2026-01-17T00:00:00Z".to_string(),
+            thumbnail_path: "thumbnail.png".to_string(),
+            state_path: "state.zst".to_string(),
+        };
+
+        store
+            .save_byte(&metadata, b"emulator-state-bytes", b"png-thumbnail")
+            .expect("save_byte should succeed");
+
+        // The freshly saved Byte is immediately loadable through every reader.
+        assert_eq!(store.get("round-trip").unwrap().title, "Round Trip");
+        assert_eq!(
+            store.load_state("round-trip").unwrap(),
+            b"emulator-state-bytes"
+        );
+        assert_eq!(
+            store.load_thumbnail("round-trip").unwrap(),
+            b"png-thumbnail"
+        );
+
+        // Metadata is parseable by load_index (happy path of the crash-safety
+        // contract: payloads + valid metadata all present).
+        let indexed = store.load_index().unwrap();
+        assert_eq!(indexed.len(), 1);
+        assert_eq!(indexed[0].byte_id, "round-trip");
+
+        fs::remove_dir_all(&root).ok();
+    }
 }
