@@ -90,14 +90,38 @@ fn build_cores() -> Result<()> {
             cmd.arg(*arg);
         }
 
-        // Platform-specific workaround: mesen's Makefile auto-detects the
-        // platform via `uname -a`, but MSYS-based Windows runners report
-        // `MSYS_NT-...` which matches neither `MINGW` nor `win`, so it falls
-        // through to the unix target and produces a `.so`. Passing
-        // `platform=win` explicitly selects the mingw-compatible gcc/g++
-        // branch that produces a `.dll`.
-        if cfg!(target_os = "windows") && core.id == "mesen" {
-            cmd.arg("platform=win");
+        // Platform-specific workarounds for vendored core Makefiles.
+        if cfg!(target_os = "windows") {
+            match core.id {
+                // mesen/gambatte/mgba detect the platform via `uname -s` and
+                // match `MINGW` or lowercase `win`; MSYS-based Windows
+                // runners report `MSYS_NT-...`, which matches neither, so
+                // they fall through to the unix target and produce a `.so`.
+                // Passing `platform=win` selects the mingw-compatible
+                // gcc/g++ branch that produces a `.dll`.
+                "mesen" | "gambatte" | "mgba" => {
+                    cmd.arg("platform=win");
+                }
+                // bsnes's nall build system detects Windows via the OS env
+                // var (so `platform=win` would actually break it - nall
+                // expects `windows`). Instead: build in library mode so the
+                // standalone-application link libraries are omitted, and pin
+                // _WIN32_WINNT via the compiler override - mingw-w64 defaults
+                // to the XP-era value when it is undefined, hiding
+                // quick_exit/timespec_get from C++ standard headers under
+                // newer GCC.
+                "bsnes" => {
+                    cmd.arg("binary=library");
+                    cmd.arg("compiler=g++ -D_WIN32_WINNT=0x0603");
+                }
+                _ => {}
+            }
+        } else if cfg!(target_os = "linux") && core.id == "bsnes" {
+            // Build in library mode: the GNUmakefile evaluates `binary :=
+            // application` (its default) before target-libretro switches to
+            // library mode, leaking `-lX11 -lXext` into the core's link line,
+            // which fails on headless CI runners without X11 dev libraries.
+            cmd.arg("binary=library");
         }
 
         if core.id == "bsnes" {
