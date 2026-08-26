@@ -22,6 +22,7 @@ use sha1::{Digest, Sha1};
 use std::{
     collections::{HashMap, HashSet, VecDeque},
     fs,
+    io::{Read, Seek},
     path::{Path, PathBuf},
     sync::{
         atomic::{AtomicBool, Ordering},
@@ -733,7 +734,7 @@ fn title_from_rom_path(path: &Path) -> String {
 fn resolve_official_title(
     store: &LocalByteStore,
     rom_sha1: &str,
-    rom_path: &PathBuf,
+    rom_path: &Path,
     system: System,
     display_title: &str,
     overrides: &HashMap<String, String>,
@@ -2208,7 +2209,7 @@ fn encode_thumbnail(frame: &playbyte_libretro::VideoFrame) -> Result<Vec<u8>> {
 
 fn build_runtime_meta_from_runtime(
     runtime: &EmulatorRuntime,
-    rom_path: &PathBuf,
+    rom_path: &Path,
 ) -> Result<RuntimeMetadata> {
     let info = runtime.system_info();
     let rom_sha1 = hash_rom(rom_path)?;
@@ -2216,26 +2217,34 @@ fn build_runtime_meta_from_runtime(
         core_id: info.library_name.clone(),
         core_version: info.library_version.clone(),
         rom_sha1,
-        _rom_path: rom_path.clone(),
+        _rom_path: rom_path.to_path_buf(),
         system: system_from_rom_path(rom_path),
     })
 }
 
-fn hash_rom_without_snes_header(path: &PathBuf) -> Result<Option<String>> {
-    let data = fs::read(path)?;
-    if data.len() <= 512 || data.len() % 1024 != 512 {
+fn hash_rom_without_snes_header(path: &Path) -> Result<Option<String>> {
+    let len = fs::metadata(path)?.len();
+    if len <= 512 || len % 1024 != 512 {
         return Ok(None);
     }
+    let mut file = fs::File::open(path)?;
+    // Skip the 512-byte copier header; only the remaining bytes are hashed.
+    file.seek(std::io::SeekFrom::Start(512))?;
+    let mut reader = std::io::BufReader::new(file);
     let mut hasher = Sha1::new();
-    hasher.update(&data[512..]);
+    let mut buffer = vec![0u8; 64 * 1024];
+    loop {
+        let n = reader.read(&mut buffer)?;
+        if n == 0 {
+            break;
+        }
+        hasher.update(&buffer[..n]);
+    }
     Ok(Some(format!("{:x}", hasher.finalize())))
 }
 
-fn hash_rom(path: &PathBuf) -> Result<String> {
-    let data = fs::read(path)?;
-    let mut hasher = Sha1::new();
-    hasher.update(data);
-    Ok(format!("{:x}", hasher.finalize()))
+fn hash_rom(path: &Path) -> Result<String> {
+    Ok(playbyte_feed::sha1_hex_of_file(path)?)
 }
 
 fn system_from_rom_path(path: &Path) -> System {

@@ -16,6 +16,8 @@ use std::{
 use thiserror::Error;
 use walkdir::WalkDir;
 
+use std::io::{BufRead, BufReader};
+
 #[derive(Error, Debug)]
 pub enum FeedError {
     #[error("io error: {0}")]
@@ -496,11 +498,25 @@ fn is_rom_file(path: &Path) -> bool {
     )
 }
 
-fn hash_file(path: &Path) -> Result<String, FeedError> {
-    let data = fs::read(path)?;
+/// Stream `path` through SHA-1 without ever holding the whole file in memory.
+/// Returns the digest as lowercase hex.
+pub fn sha1_hex_of_file(path: &Path) -> Result<String, FeedError> {
     let mut hasher = Sha1::new();
-    hasher.update(data);
+    let mut reader = BufReader::with_capacity(64 * 1024, fs::File::open(path)?);
+    loop {
+        let chunk = reader.fill_buf()?;
+        if chunk.is_empty() {
+            break;
+        }
+        hasher.update(chunk);
+        let len = chunk.len();
+        reader.consume(len);
+    }
     Ok(format!("{:x}", hasher.finalize()))
+}
+
+fn hash_file(path: &Path) -> Result<String, FeedError> {
+    sha1_hex_of_file(path)
 }
 
 #[cfg(test)]
@@ -547,6 +563,40 @@ mod tests {
         assert_eq!(entries[0].byte_id, "good-byte");
 
         fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn sha1_hex_of_file_matches_known_vectors() {
+        let dir = std::env::temp_dir().join(format!("playbyte_sha1_stream_{}", std::process::id()));
+        fs::create_dir_all(&dir).expect("create temp dir");
+
+        // Empty file: well-known SHA-1 vector.
+        let empty = dir.join("empty.bin");
+        fs::write(&empty, b"").expect("create empty file");
+        assert_eq!(
+            sha1_hex_of_file(&empty).expect("hash empty file"),
+            "da39a3ee5e6b4b0d3255bfef95601890afd80709"
+        );
+
+        // "abc": standard NIST SHA-1 test vector.
+        let abc = dir.join("abc.bin");
+        fs::write(&abc, b"abc").expect("write abc");
+        assert_eq!(
+            sha1_hex_of_file(&abc).expect("hash abc"),
+            "a9993e364706816aba3e25717850c26c9cd0d89d"
+        );
+
+        // Multi-chunk input (larger than the 64 KiB reader capacity) must hash
+        // identically to a whole-file read would.
+        let big = dir.join("big.bin");
+        let payload: Vec<u8> = (0..200_000u32).map(|i| (i % 251) as u8).collect();
+        fs::write(&big, &payload).expect("write payload");
+        let mut expected = Sha1::new();
+        expected.update(&payload);
+        let expected_hex = format!("{:x}", expected.finalize());
+        assert_eq!(sha1_hex_of_file(&big).expect("hash payload"), expected_hex);
+
+        fs::remove_dir_all(&dir).ok();
     }
 
     #[test]
