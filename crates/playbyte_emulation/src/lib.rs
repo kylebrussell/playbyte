@@ -300,8 +300,13 @@ impl EmulatorRuntime {
             }),
         );
 
+        // Load the library exactly once. Extension compatibility is checked
+        // against system_info() after retro_init (which LibretroCore::load runs),
+        // and before load_game so incompatible ROMs fail fast without full game
+        // initialization.
+        let mut core = LibretroCore::load(core_path, callbacks)?;
         if let Some(ext) = rom_extension.as_deref() {
-            let info = LibretroCore::probe_system_info(core_path.as_ref())?;
+            let info = core.system_info();
             if !core_supports_extension(&info.valid_extensions, ext) {
                 return Err(RuntimeError::IncompatibleRom {
                     core: info.library_name.clone(),
@@ -310,8 +315,6 @@ impl EmulatorRuntime {
                 });
             }
         }
-
-        let mut core = LibretroCore::load(core_path, callbacks)?;
         core.load_game(rom_path)?;
         let av_info = core.system_av_info();
         let fps = if av_info.timing.fps.is_finite()
